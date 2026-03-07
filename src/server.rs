@@ -21,6 +21,7 @@ use crate::tls::TlsMode;
 
 const RATE_LIMIT_WINDOW_SECS: i64 = 60;
 const RATE_LIMIT_MAX_REQUESTS: u32 = 10;
+const RATE_LIMIT_MAX_ENTRIES: usize = 10_000;
 
 pub struct AppState {
     pub agent_json_cached: bytes::Bytes,
@@ -43,6 +44,10 @@ impl AppState {
     pub fn check_rate_limit(&self, ip: IpAddr) -> bool {
         let now = chrono::Utc::now().timestamp();
         let mut map = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
+        // Evict stale entries when the map grows too large to prevent memory exhaustion
+        if map.len() >= RATE_LIMIT_MAX_ENTRIES {
+            map.retain(|_, (_, window_start)| now - *window_start <= RATE_LIMIT_WINDOW_SECS);
+        }
         let entry = map.entry(ip).or_insert((0, now));
         if now - entry.1 > RATE_LIMIT_WINDOW_SECS {
             *entry = (1, now);
@@ -225,7 +230,7 @@ async fn handle_deposit(
         headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
+            .and_then(|v| v.rsplit(',').next())
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| addr.ip().to_string())
     } else {

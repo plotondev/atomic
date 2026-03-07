@@ -77,8 +77,10 @@ impl Credentials {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let data = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let data = zeroize::Zeroizing::new(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read {}", path.display()))?,
+        );
         serde_json::from_str(&data).context("Failed to parse credentials")
     }
 

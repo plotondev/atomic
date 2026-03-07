@@ -56,8 +56,20 @@ pub fn log_path() -> Result<PathBuf> {
 pub fn ensure_atomic_dir() -> Result<PathBuf> {
     let dir = atomic_dir()?;
     if !dir.exists() {
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .with_context(|| format!("Failed to create {}", dir.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("Failed to create {}", dir.display()))?;
+        }
     }
     Ok(dir)
 }

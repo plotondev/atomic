@@ -40,6 +40,10 @@ pub fn run(command: &[String], dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Drop sensitive data before process::exit (which skips destructors)
+    drop(signing_key);
+    drop(creds);
+
     let status = std::process::Command::new(&new_cmd[0])
         .args(&new_cmd[1..])
         .status()

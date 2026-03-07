@@ -5,6 +5,19 @@ use crate::config;
 
 pub fn open() -> Result<Connection> {
     let db_path = config::atomic_dir()?.join("atomic.db");
+
+    // Pre-create DB file with restricted permissions (0600) before SQLite opens it
+    #[cfg(unix)]
+    if !db_path.exists() {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&db_path)
+            .with_context(|| format!("Failed to create database at {}", db_path.display()))?;
+    }
+
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
 
