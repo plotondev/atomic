@@ -25,15 +25,15 @@ curl https://fin.acme.com/.well-known/agent.json
 {
 	"v": 1,
 	"id": "fin.acme.com",
+	"name": "fin.acme.com",
 	"public_key": "ed25519:m2UrN...",
-	"email": "inbox@fin.acme.com",
 	"status": "active",
 	"deposit": "https://fin.acme.com/d/",
 	"created_at": "2026-03-07T12:00:00Z"
 }
 ```
 
-Anyone can look up your agent's public key and email. The email is always `inbox@{domain}`, not configurable. The root domain redirects here.
+Anyone can look up your agent's public key. The root domain redirects here.
 
 ## Deposit box
 
@@ -41,16 +41,16 @@ Your agent needs a Stripe key. Instead of someone SSHing in and editing env vars
 
 ```bash
 $ atomic deposit-url --label stripe_key --expires 10m
-https://fin.acme.com/d/dt_a1b2c3d4e5f6
+https://fin.acme.com/d/eyJsYWJlbCI6...Rk4
 
-$ curl -X POST "https://fin.acme.com/d/dt_a1b2c3d4e5f6" -d "sk_live_abc123"
+$ curl -X POST "https://fin.acme.com/d/eyJsYWJlbCI6...Rk4" -d "sk_live_abc123"
 {"status": "deposited", "label": "stripe_key"}
 
 $ atomic vault get stripe_key
 sk_live_abc123
 ```
 
-URL works once, expires in minutes, secret is AES-256-GCM encrypted on disk. Every deposit is logged.
+URL works once (nonce-based replay prevention), expires in minutes, secret is AES-256-GCM encrypted in the vault. Every deposit is logged.
 
 ## Magic links
 
@@ -69,7 +69,7 @@ https://fin.acme.com/m/VERIFY_ABC123
 {"status": "verified", "code": "VERIFY_ABC123"}
 ```
 
-The code is one-time use (gone after the first GET) and expires in minutes. If the service also needs an email, it's always `inbox@{domain}` -- listed in agent.json, not configurable.
+The code is one-time use (gone after the first GET) and expires in minutes.
 
 ## Request signing
 
@@ -103,6 +103,7 @@ The receiver only needs the public key from `agent.json` and a signature check. 
 
 ```
 atomic init --domain <domain>                      Create identity, start server
+atomic serve                                       Run server in foreground
 atomic stop                                        Stop the server
 
 atomic whoami                                      Print identity
@@ -120,12 +121,13 @@ atomic vault get <label>                           Read a secret
 atomic vault list                                  List labels
 atomic vault delete <label>                        Remove a secret
 
-atomic sign -- <command>                           Sign outgoing request
+atomic sign [--dry-run] -- <command>                Sign outgoing request
 atomic key rotate                                  Rotate keypair
 atomic key revoke                                  Revoke identity
 
 atomic service install                             Systemd unit
 atomic service uninstall                           Remove unit
+atomic service status                              Show service status
 ```
 
 ## TLS
@@ -138,21 +140,13 @@ atomic init --domain fin.acme.com --tls-cert cert.pem --tls-key key.pem
 atomic init --domain fin.acme.com --port 8787 --no-tls
 ```
 
-## Proxy mode
-
-Already running something on 443? Atomic handles identity routes and forwards the rest.
-
-```bash
-atomic init --domain fin.acme.com --proxy-to 127.0.0.1:3000
-```
-
 ## Files
 
 ```
 ~/.atomic/
-  credentials       domain + keypair
+  credentials       domain + keypair (600 perms)
   agent.json        public identity document
-  vault.enc         encrypted secrets
+  atomic.db         SQLite database (vault, deposits, magic links)
   deposits.log      audit trail
   atomic.pid        PID file
   atomic.log        server logs
