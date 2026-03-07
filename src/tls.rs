@@ -115,21 +115,35 @@ fn ensure_acme_sh() -> Result<()> {
     }
 
     info!("Installing acme.sh...");
+    let home = dirs::home_dir().context("No home directory")?;
+    let acme_home = home.join(".acme.sh");
+
     let output = Command::new("sh")
         .args([
             "-c",
-            "curl -fsSL https://get.acme.sh | sh -s -- --install-online",
+            &format!(
+                "curl -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh | sh -s -- --install-online --home {}",
+                acme_home.display()
+            ),
         ])
         .output()
         .context("Failed to install acme.sh. Is curl available?")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("acme.sh install failed: {stderr}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!(
+            "acme.sh install failed.\n\
+             You can install it manually: curl https://get.acme.sh | sh\n\
+             stdout: {stdout}\n\
+             stderr: {stderr}"
+        );
     }
 
     // Verify it's there now
-    acme_sh_path().context("acme.sh installed but not found")?;
+    acme_sh_path().context(
+        "acme.sh installed but not found. Try installing manually: curl https://get.acme.sh | sh"
+    )?;
     info!("acme.sh installed");
     Ok(())
 }
