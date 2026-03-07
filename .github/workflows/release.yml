@@ -11,20 +11,25 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: atomic-x86_64-linux
+            cross: false
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             name: atomic-aarch64-linux
+            cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
             name: atomic-x86_64-macos
+            cross: false
           - target: aarch64-apple-darwin
             os: macos-latest
             name: atomic-aarch64-macos
+            cross: false
 
     runs-on: ${{ matrix.os }}
 
@@ -40,15 +45,16 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install musl cross-compiler (Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
-          sudo ln -sf /usr/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-musl-gcc
-          echo '[target.aarch64-unknown-linux-musl]' >> ~/.cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: "!matrix.cross"
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
