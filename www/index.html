@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<title>atomic — Domain identity for AI agents</title>
+	<meta name="description" content="One binary gives your AI agent a domain-bound keypair, signed requests, an encrypted vault, and a deposit box for receiving secrets. No cloud, no accounts." />
+	<link rel="preconnect" href="https://fonts.googleapis.com" />
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet" />
+	<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+	<!-- Nav -->
+	<header class="nav">
+		<nav class="nav-inner">
+			<a href="/" class="nav-brand">atomic</a>
+			<div class="nav-links">
+				<a href="https://github.com/plotondev/atomic" class="nav-link">GitHub</a>
+				<a href="https://github.com/plotondev/atomic#cli" class="nav-link">Docs</a>
+			</div>
+		</nav>
+	</header>
+
+	<div class="nav-spacer"></div>
+
+	<main class="page">
+
+		<!-- Hero -->
+		<h1 class="hero-heading">Domain identity for AI agents.</h1>
+
+		<p class="hero-body">
+			Your agent gets an Ed25519 keypair bound to its domain, a public identity document at <code class="ic">/.well-known/agent.json</code>, an encrypted vault, and a deposit box for receiving secrets. One binary, ~4MB, runs on the same box as the agent.
+		</p>
+
+		<pre class="code-block"><code>curl -fsSL atomic.bond/install | sh
+atomic init --domain fin.acme.com</code></pre>
+
+		<div class="cta-row">
+			<a href="https://github.com/plotondev/atomic/releases" class="cta-btn">Download</a>
+			<a href="https://github.com/plotondev/atomic" class="cta-link">View source</a>
+		</div>
+
+		<!-- agent.json -->
+		<hr class="section-rule" />
+
+		<h2 class="section-heading">agent.json</h2>
+		<p class="section-body">
+			Every agent publishes its public key at a well-known URL. The domain is the identity.
+		</p>
+
+		<pre class="code-block"><code>$ curl https://fin.acme.com/.well-known/agent.json</code></pre>
+
+		<pre class="code-block"><code>{
+  "v": 1,
+  "id": "fin.acme.com",
+  "name": "fin.acme.com",
+  "public_key": "ed25519:m2UrN...",
+  "status": "active",
+  "deposit": "https://fin.acme.com/d/",
+  "created_at": "2026-03-07T12:00:00Z"
+}</code></pre>
+
+		<p class="section-body muted">
+			<code class="ic">GET /</code> redirects here. The public key is how other services verify this agent's signatures.
+		</p>
+
+		<!-- Deposit box -->
+		<hr class="section-rule" />
+
+		<h2 class="section-heading">Deposit box</h2>
+		<p class="section-body">
+			The agent needs an API key. Instead of pasting it into a <code class="ic">.env</code>:
+		</p>
+
+		<pre class="code-block"><code><span class="code-comment"># Generate a one-time deposit URL</span>
+$ atomic deposit-url --label stripe_key --expires 10m
+https://fin.acme.com/d/eyJsYWJlbCI6...Rk4
+
+<span class="code-comment"># Whoever has the secret POSTs it</span>
+$ curl -X POST ".../d/eyJsYWJlbCI6...Rk4" -d "sk_live_abc123"
+{"status":"deposited","label":"stripe_key"}
+
+<span class="code-comment"># Agent reads it from the vault</span>
+$ atomic vault get stripe_key
+sk_live_abc123</code></pre>
+
+		<p class="section-body">
+			The URL is Ed25519-signed, works exactly once (nonce-tracked), and caps out at 24 hours. The secret is AES-256-GCM encrypted before it hits disk.
+		</p>
+
+		<pre class="code-block"><code><span class="code-comment"># Use secrets at runtime — no .env files</span>
+curl -H "Authorization: Bearer $(atomic vault get stripe_key)" \
+  https://api.stripe.com/v1/charges
+
+export OPENAI_API_KEY=$(atomic vault get openai_key)
+python agent.py</code></pre>
+
+		<!-- Magic links -->
+		<hr class="section-rule" />
+
+		<h2 class="section-heading">Magic links</h2>
+		<p class="section-body">
+			Domain verification, like DNS TXT records but over HTTP. A service gives the agent a code, the agent hosts it, the service checks.
+		</p>
+
+		<pre class="code-block"><code>$ atomic magic-link host VERIFY_ABC123 --expires 5m
+https://fin.acme.com/m/VERIFY_ABC123
+
+$ curl https://fin.acme.com/m/VERIFY_ABC123
+{"status":"verified","code":"VERIFY_ABC123"}</code></pre>
+
+		<p class="section-body muted">
+			One-time use, gone after the first GET, expires in minutes.
+		</p>
+
+		<!-- Request signing -->
+		<hr class="section-rule" />
+
+		<h2 class="section-heading">Request signing</h2>
+		<p class="section-body">
+			Every outgoing request gets an Ed25519 signature. The receiving service verifies against the public key in <code class="ic">agent.json</code>.
+		</p>
+
+		<pre class="code-block"><code>$ atomic sign -- curl -X POST https://partner.api.com/transfer \
+    -d '{"amount": 5000}'
+
+<span class="code-comment"># Adds headers: X-Agent-Id, X-Agent-Sig, X-Agent-Sig-Time</span></code></pre>
+
+		<p class="section-body">
+			Verification on the receiving end:
+		</p>
+
+		<pre class="code-block"><code><span class="code-comment"># Python — four lines, no SDK</span>
+agent = requests.get(f"https://{agent_id}/.well-known/agent.json").json()
+key_bytes = base64.b64decode(agent["public_key"].removeprefix("ed25519:"))
+pub_key = Ed25519PublicKey.from_public_bytes(key_bytes)
+pub_key.verify(base64.b64decode(signature), f"{sig_time}.{body}".encode())</code></pre>
+
+		<!-- Why not JWTs -->
+		<hr class="section-rule" />
+
+		<h2 class="section-heading">Why not JWTs?</h2>
+		<p class="section-body">
+			When a human logs into a service, the service issues a token. The agent carries it around, sends it on every request, refreshes it when it expires. Agents don't need that. An agent with a keypair can prove itself on every request by signing it.
+		</p>
+
+		<div class="table-wrap">
+			<table class="comparison-table">
+				<thead>
+					<tr>
+						<th></th>
+						<th>Human (JWT)</th>
+						<th>Agent (Atomic)</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr><td>Identity</td><td>email + password</td><td>domain (<code class="ic">fin.acme.com</code>)</td></tr>
+					<tr><td>Signup</td><td>create account, get credentials</td><td>sign request + magic link</td></tr>
+					<tr><td>Proof</td><td>service issues a JWT</td><td>agent signs every request</td></tr>
+					<tr><td>Each request</td><td>send JWT, service checks it</td><td>send signature, service checks agent.json</td></tr>
+					<tr><td>Expiry</td><td>token expires, re-auth</td><td>no token — signatures are stateless</td></tr>
+					<tr><td>Revocation</td><td>service invalidates token</td><td>agent.json status &rarr; <code class="ic">revoked</code></td></tr>
+					<tr><td>Storage</td><td>store token, handle refresh</td><td>private key on disk, nothing to refresh</td></tr>
+				</tbody>
+			</table>
+		</div>
+
+		<p class="section-body muted">
+			Performance-wise, JWT verification is a single HMAC check while Ed25519 verify costs more. But "more" here means microseconds, and the public key caches well. It's not where your latency lives.
+		</p>
+
+		<!-- Security -->
+		<hr class="section-rule" />
+
+		<h2 class="section-heading">Security</h2>
+		<p class="section-body">
+			Private key stored at 600 permissions, never leaves the box. Vault uses AES-256-GCM with a key derived from the private key via HKDF — separate from the signing key.
+		</p>
+		<p class="section-body">
+			Deposit tokens are Ed25519-signed with a nonce and a 24h max TTL. Every failure returns 404 regardless of the reason, so you can't probe for valid tokens. Body size capped at 1MB.
+		</p>
+		<p class="section-body muted">
+			All responses get <code class="ic">nosniff</code>, <code class="ic">no-store</code>, and <code class="ic">no-referrer</code> headers. HSTS (2-year max-age) when TLS is on. SQL is parameterized everywhere.
+		</p>
+
+		<!-- Install -->
+		<hr class="section-rule" />
+
+		<h2 class="section-heading">Install</h2>
+
+		<pre class="code-block"><code><span class="code-comment"># One-line install</span>
+curl -fsSL atomic.bond/install | sh
+
+<span class="code-comment"># Or build from source</span>
+git clone https://github.com/plotondev/atomic.git
+cd atomic && cargo build --release</code></pre>
+
+		<p class="section-body">
+			Binaries for Linux (x86_64, aarch64) and macOS (x86_64, Apple Silicon) on the <a href="https://github.com/plotondev/atomic/releases" class="body-link">releases page</a>.
+		</p>
+
+		<!-- Footer CTA -->
+		<hr class="section-rule" />
+
+		<div class="cta-row">
+			<a href="https://github.com/plotondev/atomic/releases" class="cta-btn">Download</a>
+			<a href="https://github.com/plotondev/atomic" class="cta-link">View source</a>
+		</div>
+
+		<p class="contact">
+			MIT License. Questions? <a href="mailto:hello@ploton.ai" class="body-link">hello@ploton.ai</a>
+		</p>
+
+	</main>
+
+</body>
+</html>
