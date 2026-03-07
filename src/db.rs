@@ -35,6 +35,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS vault_secrets (
             label      TEXT PRIMARY KEY,
             value      BLOB NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS deposit_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            label      TEXT NOT NULL,
+            source_ip  TEXT,
+            user_agent TEXT,
+            deposited_at INTEGER NOT NULL
         );",
     )
     .context("Failed to run migrations")?;

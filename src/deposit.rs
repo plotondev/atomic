@@ -101,6 +101,61 @@ pub fn claim_nonce_with_conn(
     Ok(())
 }
 
+/// Record deposit metadata in the database.
+pub fn log_deposit(
+    conn: &rusqlite::Connection,
+    label: &str,
+    source_ip: &str,
+    user_agent: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO deposit_log (label, source_ip, user_agent, deposited_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![label, source_ip, user_agent, now],
+    )?;
+    Ok(())
+}
+
+/// List deposit log entries, optionally filtered by label.
+pub fn list_deposits(label_filter: Option<&str>) -> Result<()> {
+    let conn = crate::db::open()?;
+
+    let query = match label_filter {
+        Some(_) => "SELECT label, source_ip, user_agent, deposited_at FROM deposit_log WHERE label = ?1 ORDER BY deposited_at DESC",
+        None => "SELECT label, source_ip, user_agent, deposited_at FROM deposit_log ORDER BY deposited_at DESC",
+    };
+    let mut stmt = conn.prepare(query)?;
+
+    let mut rows = if let Some(label) = label_filter {
+        stmt.query(rusqlite::params![label])?
+    } else {
+        stmt.query([])?
+    };
+
+    let mut found = false;
+    while let Some(row) = rows.next()? {
+        let label: String = row.get(0)?;
+        let ip: String = row.get(1)?;
+        let ua: String = row.get(2)?;
+        let ts: i64 = row.get(3)?;
+        let time = chrono::DateTime::from_timestamp(ts, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| ts.to_string());
+        println!("{time}  {label}");
+        println!("  IP:         {ip}");
+        if !ua.is_empty() {
+            println!("  User-Agent: {ua}");
+        }
+        println!();
+        found = true;
+    }
+
+    if !found {
+        println!("No deposits yet.");
+    }
+    Ok(())
+}
+
 fn generate_nonce() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 16];

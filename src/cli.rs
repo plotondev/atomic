@@ -66,7 +66,11 @@ pub enum Command {
     },
 
     /// Show deposit audit log
-    Deposits,
+    Deposits {
+        /// Filter by label
+        #[arg(long)]
+        label: Option<String>,
+    },
 
     /// Encrypted secret vault
     Vault {

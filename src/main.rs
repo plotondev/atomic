@@ -137,18 +137,8 @@ async fn main() -> Result<()> {
             println!("{url}");
         }
 
-        Command::Deposits => {
-            let log_path = config::deposits_log_path()?;
-            if !log_path.exists() {
-                println!("No deposits yet.");
-                return Ok(());
-            }
-            let content = std::fs::read_to_string(&log_path)?;
-            if content.is_empty() {
-                println!("No deposits yet.");
-            } else {
-                print!("{content}");
-            }
+        Command::Deposits { label } => {
+            deposit::list_deposits(label.as_deref())?;
         }
 
         Command::Vault { command } => {

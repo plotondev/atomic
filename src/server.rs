@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::{
-    extract::{DefaultBodyLimit, Path, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -110,7 +110,10 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("Failed to bind to {addr}"))?;
-            axum::serve(listener, app)
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
                 .with_graceful_shutdown(shutdown_signal())
                 .await
                 .context("Server error")?;
@@ -127,7 +130,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
             info!("Listening on {} (HTTPS/acme.sh, PID {})", addr, std::process::id());
             axum_server::bind_rustls(addr, rustls_config)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .context("TLS server error")?;
         }
@@ -142,7 +145,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
             info!("Listening on {} (HTTPS/custom cert, PID {})", addr, std::process::id());
             axum_server::bind_rustls(addr, rustls_config)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .context("TLS server error")?;
         }
@@ -169,6 +172,8 @@ async fn serve_agent_json(State(state): State<Arc<AppState>>) -> Response {
 // Verify the signed token, store the POST body in the vault under the encoded label.
 async fn handle_deposit(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(token): Path<String>,
     body: String,
 ) -> Response {
@@ -185,6 +190,18 @@ async fn handle_deposit(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    let source_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
     // DB operations in spawn_blocking
     let label = payload.label.clone();
     let state_clone = state.clone();
@@ -193,7 +210,8 @@ async fn handle_deposit(
         let conn = state_clone.db.lock()
             .map_err(|e| anyhow::anyhow!("DB mutex poisoned: {e}"))?;
         crate::deposit::claim_nonce_with_conn(&payload, &conn)?;
-        crate::vault::vault_set_with_conn(&conn, &payload.label, &body_clone, &vault_key)
+        crate::vault::vault_set_with_conn(&conn, &payload.label, &body_clone, &vault_key)?;
+        crate::deposit::log_deposit(&conn, &payload.label, &source_ip, &user_agent)
     }).await;
 
     match deposit_result {
@@ -212,7 +230,6 @@ async fn handle_deposit(
         }
     }
 
-    let _ = append_deposit_log(&label);
     info!("Deposit received: '{label}'");
 
     let resp = DepositResponse { status: "deposited", label };
@@ -256,22 +273,6 @@ async fn handle_magic_link(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
-}
-
-fn append_deposit_log(label: &str) -> Result<()> {
-    use std::io::Write;
-    let log_path = config::deposits_log_path()?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    writeln!(
-        file,
-        "{}\t{}\tdeposited",
-        chrono::Utc::now().to_rfc3339(),
-        label,
-    )?;
-    Ok(())
 }
 
 async fn handle_404() -> StatusCode {
