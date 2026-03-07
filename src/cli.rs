@@ -31,6 +31,10 @@ pub enum Command {
         #[arg(long)]
         tls_key: Option<String>,
 
+        /// Trust X-Forwarded-For header (use when behind a reverse proxy)
+        #[arg(long)]
+        proxy: bool,
+
         /// Overwrite existing identity
         #[arg(long)]
         force: bool,
@@ -114,8 +118,8 @@ pub enum VaultCommand {
     Set {
         /// Label for the secret
         label: String,
-        /// Secret value
-        value: String,
+        /// Secret value (omit to read from stdin)
+        value: Option<String>,
     },
     /// Retrieve a secret
     Get {

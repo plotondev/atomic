@@ -33,9 +33,10 @@ async fn main() -> Result<()> {
             no_tls,
             tls_cert,
             tls_key,
+            proxy,
             force,
         } => {
-            init::run(&domain, port, no_tls, tls_cert, tls_key, force)?;
+            init::run(&domain, port, no_tls, tls_cert, tls_key, force, proxy)?;
         }
 
         Command::Serve => {
@@ -146,7 +147,22 @@ async fn main() -> Result<()> {
             let sk = creds.signing_key()?;
             let vault_key = crypto::vault::derive_vault_key(&sk.to_bytes())?;
             match command {
-                VaultCommand::Set { label, value } => vault::cmd_set(&label, &value, &vault_key)?,
+                VaultCommand::Set { label, value } => {
+                    let value = match value {
+                        Some(v) => v,
+                        None => {
+                            use std::io::Read;
+                            let mut buf = String::new();
+                            std::io::stdin().read_to_string(&mut buf)?;
+                            let v = buf.trim_end_matches('\n').to_string();
+                            if v.is_empty() {
+                                anyhow::bail!("No value provided (pass as argument or pipe via stdin)");
+                            }
+                            v
+                        }
+                    };
+                    vault::cmd_set(&label, &value, &vault_key)?
+                }
                 VaultCommand::Get { label } => vault::cmd_get(&label, &vault_key)?,
                 VaultCommand::List => vault::cmd_list()?,
                 VaultCommand::Delete { label } => vault::cmd_delete(&label)?,

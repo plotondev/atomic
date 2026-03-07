@@ -14,6 +14,7 @@ pub fn run(
     tls_cert: Option<String>,
     tls_key: Option<String>,
     force: bool,
+    proxy: bool,
 ) -> Result<()> {
     // Validate domain format
     if domain.len() > 253 {
@@ -77,6 +78,7 @@ pub fn run(
         no_tls,
         tls_cert,
         tls_key,
+        proxy,
     );
     let creds_path = config::credentials_path()?;
     credentials.save(&creds_path)?;

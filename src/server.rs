@@ -8,7 +8,8 @@ use axum::{
     Router,
 };
 use serde::Serialize;
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
@@ -18,6 +19,9 @@ use crate::config;
 use crate::credentials::Credentials;
 use crate::tls::TlsMode;
 
+const RATE_LIMIT_WINDOW_SECS: i64 = 60;
+const RATE_LIMIT_MAX_REQUESTS: u32 = 10;
+
 pub struct AppState {
     pub agent_json_cached: bytes::Bytes,
     pub verifying_key: ed25519_dalek::VerifyingKey,
@@ -26,11 +30,29 @@ pub struct AppState {
     /// Only lock inside `spawn_blocking` — never hold across an `.await`.
     pub db: std::sync::Mutex<rusqlite::Connection>,
     pub tls_active: bool,
+    pub behind_proxy: bool,
+    rate_limiter: std::sync::Mutex<HashMap<IpAddr, (u32, i64)>>,
 }
 
 impl AppState {
     pub fn vault_key(&self) -> &[u8; 32] {
         &self.vault_key
+    }
+
+    /// Returns true if the request is within rate limits.
+    pub fn check_rate_limit(&self, ip: IpAddr) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let mut map = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.entry(ip).or_insert((0, now));
+        if now - entry.1 > RATE_LIMIT_WINDOW_SECS {
+            *entry = (1, now);
+            true
+        } else if entry.0 >= RATE_LIMIT_MAX_REQUESTS {
+            false
+        } else {
+            entry.0 += 1;
+            true
+        }
     }
 }
 
@@ -68,15 +90,19 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
 
     let tls_active = !matches!(tls_mode, TlsMode::None);
 
+    let behind_proxy = credentials.proxy;
+
     let state = Arc::new(AppState {
         agent_json_cached,
         verifying_key,
         vault_key,
         db: std::sync::Mutex::new(db_conn),
         tls_active,
+        behind_proxy,
+        rate_limiter: std::sync::Mutex::new(HashMap::new()),
     });
 
-    // Background task: clean expired magic links + old deposit nonces every hour
+    // Background task: clean expired magic links, old deposit nonces, and stale rate limiter entries
     let db_clone = state.clone();
     tokio::spawn(async move {
         loop {
@@ -88,6 +114,11 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                     let _ = conn.execute("DELETE FROM magic_links WHERE expires_at <= ?1", [now]);
                     let cutoff = now - 7 * 86400;
                     let _ = conn.execute("DELETE FROM used_deposits WHERE used_at < ?1", [cutoff]);
+                }
+                // Evict stale rate limiter entries
+                if let Ok(mut map) = db_ref.rate_limiter.lock() {
+                    let now = chrono::Utc::now().timestamp();
+                    map.retain(|_, (_, window_start)| now - *window_start <= RATE_LIMIT_WINDOW_SECS);
                 }
             }).await;
         }
@@ -178,7 +209,6 @@ async fn handle_deposit(
     body: String,
 ) -> Response {
     let verifying_key = state.verifying_key;
-    let vault_key = *state.vault_key();
 
     // Verify signature + expiry (no DB needed yet)
     let payload = match crate::deposit::verify_signature(&token, &verifying_key) {
@@ -190,19 +220,26 @@ async fn handle_deposit(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let source_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| addr.ip().to_string());
+    // Only trust X-Forwarded-For when running behind a known reverse proxy
+    let source_ip = if state.behind_proxy {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| addr.ip().to_string())
+    } else {
+        addr.ip().to_string()
+    };
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
 
-    // DB operations in spawn_blocking
+    // DB operations in spawn_blocking.
+    // Access vault_key via the Arc<AppState> reference inside the closure
+    // to avoid copying the key out of its Zeroizing wrapper.
     let label = payload.label.clone();
     let state_clone = state.clone();
     let body_clone = body;
@@ -210,7 +247,7 @@ async fn handle_deposit(
         let conn = state_clone.db.lock()
             .map_err(|e| anyhow::anyhow!("DB mutex poisoned: {e}"))?;
         crate::deposit::claim_nonce_with_conn(&payload, &conn)?;
-        crate::vault::vault_set_with_conn(&conn, &payload.label, &body_clone, &vault_key)?;
+        crate::vault::vault_set_with_conn(&conn, &payload.label, &body_clone, state_clone.vault_key())?;
         crate::deposit::log_deposit(&conn, &payload.label, &source_ip, &user_agent)
     }).await;
 
@@ -241,8 +278,14 @@ async fn handle_deposit(
 
 async fn handle_magic_link(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(code): Path<String>,
 ) -> Response {
+    // Per-IP rate limiting to prevent brute-force of magic link codes
+    if !state.check_rate_limit(addr.ip()) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+
     let state_clone = state.clone();
     let code_clone = code;
     let result = tokio::task::spawn_blocking(move || {

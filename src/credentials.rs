@@ -2,10 +2,11 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use zeroize::Zeroize;
 
 use crate::crypto::signing;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Credentials {
     pub domain: String,
     pub private_key: String,
@@ -16,6 +17,27 @@ pub struct Credentials {
     pub tls_cert: Option<String>,
     #[serde(default)]
     pub tls_key: Option<String>,
+    #[serde(default)]
+    pub proxy: bool,
+}
+
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("domain", &self.domain)
+            .field("private_key", &"[REDACTED]")
+            .field("public_key", &self.public_key)
+            .field("port", &self.port)
+            .field("no_tls", &self.no_tls)
+            .field("proxy", &self.proxy)
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -27,6 +49,7 @@ impl Credentials {
         no_tls: bool,
         tls_cert: Option<String>,
         tls_key: Option<String>,
+        proxy: bool,
     ) -> Self {
         Self {
             domain,
@@ -36,6 +59,7 @@ impl Credentials {
             no_tls,
             tls_cert,
             tls_key,
+            proxy,
         }
     }
 
@@ -80,7 +104,7 @@ mod tests {
 
     fn make_creds(domain: &str, port: u16, no_tls: bool) -> Credentials {
         let (sk, vk) = signing::generate_keypair();
-        Credentials::new(domain.into(), &sk, &vk, port, no_tls, None, None)
+        Credentials::new(domain.into(), &sk, &vk, port, no_tls, None, None, false)
     }
 
     #[test]
@@ -106,7 +130,7 @@ mod tests {
     #[test]
     fn credentials_roundtrip_keys() {
         let (sk, vk) = signing::generate_keypair();
-        let creds = Credentials::new("test.com".into(), &sk, &vk, 443, false, None, None);
+        let creds = Credentials::new("test.com".into(), &sk, &vk, 443, false, None, None, false);
         let decoded_sk = creds.signing_key().unwrap();
         let decoded_vk = creds.verifying_key().unwrap();
         assert_eq!(sk.to_bytes(), decoded_sk.to_bytes());
@@ -116,7 +140,7 @@ mod tests {
     #[test]
     fn credentials_save_load_roundtrip() {
         let (sk, vk) = signing::generate_keypair();
-        let creds = Credentials::new("rt.example.com".into(), &sk, &vk, 443, false, None, None);
+        let creds = Credentials::new("rt.example.com".into(), &sk, &vk, 443, false, None, None, false);
         let tmp = std::env::temp_dir().join(format!("atomic_test_creds_{}", std::process::id()));
         creds.save(&tmp).unwrap();
         let loaded = Credentials::load(&tmp).unwrap();

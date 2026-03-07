@@ -20,9 +20,20 @@ pub fn open() -> Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
+    // Migrate magic_links from old schema (plaintext `code`) to new (hashed `code_hash`).
+    // Magic links are short-lived, so dropping the table is safe.
+    let has_old_schema = conn
+        .prepare("SELECT code FROM magic_links LIMIT 0")
+        .is_ok();
+    if has_old_schema {
+        conn.execute_batch("DROP TABLE magic_links;")
+            .context("Failed to migrate magic_links table")?;
+    }
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS magic_links (
-            code       TEXT PRIMARY KEY,
+            code_hash  TEXT PRIMARY KEY,
+            hint       TEXT NOT NULL DEFAULT '',
             expires_at INTEGER NOT NULL
         );
 

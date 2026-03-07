@@ -2,16 +2,23 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 pub fn write_secure(path: &Path, data: &[u8]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    // Atomic write: write to .tmp, set perms, then rename into place.
-    // Prevents race where another process reads with default permissions.
+    // Atomic write: create .tmp with 0600 from the start, then rename.
+    // Using OpenOptionsExt::mode() sets permissions at creation time,
+    // eliminating the TOCTOU window where the file could be world-readable.
     let tmp_path = path.with_extension("tmp");
-    std::fs::write(&tmp_path, data)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp_path)
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(&tmp_path, perms)
-        .with_context(|| format!("Failed to set permissions on {}", tmp_path.display()))?;
+    file.write_all(data)
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    drop(file);
     std::fs::rename(&tmp_path, path)
         .with_context(|| format!("Failed to rename {} to {}", tmp_path.display(), path.display()))?;
     Ok(())

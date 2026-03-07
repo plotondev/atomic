@@ -1,8 +1,14 @@
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::db;
 use crate::deposit::parse_duration;
+
+fn hash_code(code: &str) -> String {
+    let hash = Sha256::digest(code.as_bytes());
+    hex::encode(hash)
+}
 
 pub fn host(code: &str, expires: &str) -> Result<()> {
     if code.len() < 8 {
@@ -12,10 +18,13 @@ pub fn host(code: &str, expires: &str) -> Result<()> {
     let expires_at = chrono::Utc::now().timestamp()
         + i64::try_from(duration.as_secs()).map_err(|_| anyhow::anyhow!("Duration too large"))?;
 
+    let code_hash = hash_code(code);
+    let hint = &code[..4.min(code.len())];
+
     let conn = db::open()?;
     conn.execute(
-        "INSERT OR REPLACE INTO magic_links (code, expires_at) VALUES (?1, ?2)",
-        rusqlite::params![code, expires_at],
+        "INSERT OR REPLACE INTO magic_links (code_hash, hint, expires_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![code_hash, hint, expires_at],
     )?;
 
     let creds = crate::credentials::Credentials::load(&config::credentials_path()?)?;
@@ -33,18 +42,18 @@ pub fn list() -> Result<()> {
     // clean expired
     conn.execute("DELETE FROM magic_links WHERE expires_at <= ?1", [now])?;
 
-    let mut stmt = conn.prepare("SELECT code, expires_at FROM magic_links ORDER BY expires_at")?;
+    let mut stmt = conn.prepare("SELECT hint, expires_at FROM magic_links ORDER BY expires_at")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
 
     let mut found = false;
     for row in rows {
-        let (code, expires_at) = row?;
+        let (hint, expires_at) = row?;
         let remaining = expires_at - now;
         let mins = remaining / 60;
         let secs = remaining % 60;
-        println!("{code}  (expires in {mins}m {secs}s)");
+        println!("{hint}****  (expires in {mins}m {secs}s)");
         found = true;
     }
 
@@ -55,15 +64,15 @@ pub fn list() -> Result<()> {
 }
 
 /// Called by the server to check and consume a code. One-time use.
-/// Uses a provided connection reference instead of opening its own.
+/// The code is hashed before lookup, so DB comparison timing is irrelevant.
 pub fn claim_with_conn(code: &str, conn: &rusqlite::Connection) -> Option<String> {
     let now = chrono::Utc::now().timestamp();
+    let code_hash = hash_code(code);
 
-    // try to delete the matching code and check if it existed
     let deleted = conn
         .execute(
-            "DELETE FROM magic_links WHERE code = ?1 AND expires_at > ?2",
-            rusqlite::params![code, now],
+            "DELETE FROM magic_links WHERE code_hash = ?1 AND expires_at > ?2",
+            rusqlite::params![code_hash, now],
         )
         .ok()?;
 
@@ -81,49 +90,66 @@ mod tests {
     fn test_db() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE magic_links (code TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);"
+            "CREATE TABLE magic_links (code_hash TEXT PRIMARY KEY, hint TEXT NOT NULL DEFAULT '', expires_at INTEGER NOT NULL);"
         ).unwrap();
         conn
+    }
+
+    fn insert_code(conn: &rusqlite::Connection, code: &str, expires_at: i64) {
+        let code_hash = hash_code(code);
+        let hint = &code[..4.min(code.len())];
+        conn.execute(
+            "INSERT INTO magic_links (code_hash, hint, expires_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![code_hash, hint, expires_at],
+        ).unwrap();
     }
 
     #[test]
     fn claim_valid_code() {
         let conn = test_db();
         let future = chrono::Utc::now().timestamp() + 300;
-        conn.execute(
-            "INSERT INTO magic_links (code, expires_at) VALUES (?1, ?2)",
-            rusqlite::params!["abc123", future],
-        ).unwrap();
-        assert_eq!(claim_with_conn("abc123", &conn), Some("abc123".to_string()));
+        insert_code(&conn, "abc12345", future);
+        assert_eq!(claim_with_conn("abc12345", &conn), Some("abc12345".to_string()));
     }
 
     #[test]
     fn claim_expired_code() {
         let conn = test_db();
         let past = chrono::Utc::now().timestamp() - 10;
-        conn.execute(
-            "INSERT INTO magic_links (code, expires_at) VALUES (?1, ?2)",
-            rusqlite::params!["expired", past],
-        ).unwrap();
-        assert!(claim_with_conn("expired", &conn).is_none());
+        insert_code(&conn, "expired!", past);
+        assert!(claim_with_conn("expired!", &conn).is_none());
     }
 
     #[test]
     fn claim_nonexistent_code() {
         let conn = test_db();
-        assert!(claim_with_conn("nope", &conn).is_none());
+        assert!(claim_with_conn("nope1234", &conn).is_none());
     }
 
     #[test]
     fn claim_one_time_use() {
         let conn = test_db();
         let future = chrono::Utc::now().timestamp() + 300;
-        conn.execute(
-            "INSERT INTO magic_links (code, expires_at) VALUES (?1, ?2)",
-            rusqlite::params!["once", future],
-        ).unwrap();
-        assert!(claim_with_conn("once", &conn).is_some());
-        assert!(claim_with_conn("once", &conn).is_none());
+        insert_code(&conn, "onceonly", future);
+        assert!(claim_with_conn("onceonly", &conn).is_some());
+        assert!(claim_with_conn("onceonly", &conn).is_none());
+    }
+
+    #[test]
+    fn hash_code_is_deterministic() {
+        assert_eq!(hash_code("test1234"), hash_code("test1234"));
+    }
+
+    #[test]
+    fn hash_code_differs_for_different_inputs() {
+        assert_ne!(hash_code("test1234"), hash_code("test5678"));
+    }
+
+    #[test]
+    fn wrong_code_does_not_match() {
+        let conn = test_db();
+        let future = chrono::Utc::now().timestamp() + 300;
+        insert_code(&conn, "correct!", future);
+        assert!(claim_with_conn("wrongone", &conn).is_none());
     }
 }
-
