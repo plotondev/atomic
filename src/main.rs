@@ -121,7 +121,10 @@ async fn main() -> Result<()> {
             println!("  Public Key: {}", agent.public_key);
             println!("  Status:     {}", agent.status);
             println!("  Created:    {}", agent.created_at);
-            if agent.status == "active" {
+            if agent.id != domain {
+                println!("  WARNING:    agent.id '{}' does not match requested domain '{}'", agent.id, domain);
+                println!("  Result:     DOMAIN MISMATCH");
+            } else if agent.status == "active" {
                 println!("  Result:     VALID");
             } else {
                 println!("  Result:     {}", agent.status.to_uppercase());

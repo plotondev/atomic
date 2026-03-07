@@ -11,15 +11,17 @@ fn hash_code(code: &str) -> String {
 }
 
 pub fn host(code: &str, expires: &str) -> Result<()> {
-    if code.len() < 8 {
-        anyhow::bail!("Code must be at least 8 characters (got {}). Use a longer code to prevent brute-force.", code.len());
+    if code.len() < 20 {
+        anyhow::bail!("Code must be at least 20 characters (got {}). Use a longer code to prevent brute-force.", code.len());
     }
     let duration = parse_duration(expires)?;
+    let max_secs: u64 = 3600; // 1 hour max for magic links
+    let capped_secs = duration.as_secs().min(max_secs);
     let expires_at = chrono::Utc::now().timestamp()
-        + i64::try_from(duration.as_secs()).map_err(|_| anyhow::anyhow!("Duration too large"))?;
+        + i64::try_from(capped_secs).map_err(|_| anyhow::anyhow!("Duration too large"))?;
 
     let code_hash = hash_code(code);
-    let hint = &code[..4.min(code.len())];
+    let hint = &code[..2.min(code.len())];
 
     let conn = db::open()?;
     conn.execute(
@@ -97,7 +99,7 @@ mod tests {
 
     fn insert_code(conn: &rusqlite::Connection, code: &str, expires_at: i64) {
         let code_hash = hash_code(code);
-        let hint = &code[..4.min(code.len())];
+        let hint = &code[..2.min(code.len())];
         conn.execute(
             "INSERT INTO magic_links (code_hash, hint, expires_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![code_hash, hint, expires_at],

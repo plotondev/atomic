@@ -1,14 +1,18 @@
 use anyhow::{Context, Result};
+use rand::RngCore;
 use std::path::{Path, PathBuf};
 
 pub fn write_secure(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    // Atomic write: create .tmp with 0600 from the start, then rename.
+    // Atomic write: create temp file with 0600 from the start, then rename.
     // Using OpenOptionsExt::mode() sets permissions at creation time,
     // eliminating the TOCTOU window where the file could be world-readable.
-    let tmp_path = path.with_extension("tmp");
+    // Random suffix prevents collisions between concurrent writers.
+    let mut suffix = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut suffix);
+    let tmp_path = path.with_extension(format!("tmp.{}", hex::encode(suffix)));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

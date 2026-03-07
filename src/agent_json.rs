@@ -29,12 +29,7 @@ impl AgentJson {
     pub fn save(&self, path: &Path) -> Result<()> {
         let json =
             serde_json::to_string_pretty(self).context("Failed to serialize agent.json")?;
-        // Atomic write: tmp + rename to prevent corruption on crash
-        let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, &json)
-            .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, path)
-            .with_context(|| format!("Failed to rename {} to {}", tmp_path.display(), path.display()))
+        crate::config::write_secure(path, json.as_bytes())
     }
 
     pub fn load(path: &Path) -> Result<Self> {

@@ -104,7 +104,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         db: std::sync::Mutex::new(db_conn),
         tls_active,
         behind_proxy,
-        rate_limiter: std::sync::Mutex::new(HashMap::new()),
+        rate_limiter: std::sync::Mutex::new(HashMap::with_capacity(256)),
     });
 
     // Background task: clean expired magic links, old deposit nonces, and stale rate limiter entries
@@ -116,9 +116,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = db_ref.db.lock() {
                     let now = chrono::Utc::now().timestamp();
-                    let _ = conn.execute("DELETE FROM magic_links WHERE expires_at <= ?1", [now]);
+                    if let Err(e) = conn.execute("DELETE FROM magic_links WHERE expires_at <= ?1", [now]) {
+                        tracing::warn!("Failed to clean expired magic links: {e}");
+                    }
                     let cutoff = now - 7 * 86400;
-                    let _ = conn.execute("DELETE FROM used_deposits WHERE used_at < ?1", [cutoff]);
+                    if let Err(e) = conn.execute("DELETE FROM used_deposits WHERE used_at < ?1", [cutoff]) {
+                        tracing::warn!("Failed to clean old deposit nonces: {e}");
+                    }
                 }
                 // Evict stale rate limiter entries
                 if let Ok(mut map) = db_ref.rate_limiter.lock() {
@@ -129,14 +133,20 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         }
     });
 
+    // CORS only on the public agent.json endpoint; deposit and magic link
+    // endpoints are called by servers, not browsers, and don't need CORS.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let public_routes = Router::new()
+        .route("/.well-known/agent.json", get(serve_agent_json))
+        .layer(cors);
+
     let app = Router::new()
         .route("/", get(root_redirect))
-        .route("/.well-known/agent.json", get(serve_agent_json))
+        .merge(public_routes)
         .route("/d/{token}", post(handle_deposit))
         .route("/m/{code}", get(handle_magic_link))
         .fallback(handle_404)
@@ -145,7 +155,6 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
             state.clone(),
             security_headers,
         ))
-        .layer(cors)
         .with_state(state);
 
     let pid_path = config::pid_path()?;
@@ -245,7 +254,6 @@ async fn handle_deposit(
     // DB operations in spawn_blocking.
     // Access vault_key via the Arc<AppState> reference inside the closure
     // to avoid copying the key out of its Zeroizing wrapper.
-    let label = payload.label.clone();
     let state_clone = state.clone();
     let body_clone = body;
     let deposit_result = tokio::task::spawn_blocking(move || {
@@ -253,31 +261,31 @@ async fn handle_deposit(
             .map_err(|e| anyhow::anyhow!("DB mutex poisoned: {e}"))?;
         crate::deposit::claim_nonce_with_conn(&payload, &conn)?;
         crate::vault::vault_set_with_conn(&conn, &payload.label, &body_clone, state_clone.vault_key())?;
-        crate::deposit::log_deposit(&conn, &payload.label, &source_ip, &user_agent)
+        crate::deposit::log_deposit(&conn, &payload.label, &source_ip, &user_agent)?;
+        Ok::<_, anyhow::Error>(payload.label)
     }).await;
 
     match deposit_result {
-        Ok(Ok(())) => {},
+        Ok(Ok(label)) => {
+            info!("Deposit received: '{label}'");
+            let resp = DepositResponse { status: "deposited", label };
+            match serde_json::to_string(&resp) {
+                Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
         Ok(Err(e)) => {
             let err_msg = format!("{e}");
             if err_msg.contains("replay") || err_msg.contains("Nonce already used") {
                 return StatusCode::NOT_FOUND.into_response();
             }
             tracing::error!("Deposit failed: {}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
         Err(e) => {
             tracing::error!("Deposit task panicked: {}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
-    }
-
-    info!("Deposit received: '{label}'");
-
-    let resp = DepositResponse { status: "deposited", label };
-    match serde_json::to_string(&resp) {
-        Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -341,6 +349,10 @@ async fn security_headers(
     headers.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'"),
     );
     if state.tls_active {
         headers.insert(

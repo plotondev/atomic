@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(not(unix))]
+use anyhow::Context;
 
 use crate::config;
 use crate::credentials::Credentials;
@@ -40,29 +42,30 @@ pub fn run(command: &[String], dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Drop sensitive data before process::exit (which skips destructors)
-    drop(signing_key);
-    drop(creds);
+    // On Unix, exec replaces the process image entirely — no memory lingers,
+    // so there is no need to manually drop/zeroize sensitive data.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&new_cmd[0])
+            .args(&new_cmd[1..])
+            .exec();
+        // exec() only returns on error
+        anyhow::bail!("Failed to exec {}: {}", new_cmd[0], err);
+    }
 
-    let status = std::process::Command::new(&new_cmd[0])
-        .args(&new_cmd[1..])
-        .status()
-        .with_context(|| format!("Failed to execute: {}", new_cmd[0]))?;
+    #[cfg(not(unix))]
+    {
+        drop(signing_key);
+        drop(creds);
 
-    let exit_code = if let Some(code) = status.code() {
-        code
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            128 + status.signal().unwrap_or(1)
-        }
-        #[cfg(not(unix))]
-        {
-            1
-        }
-    };
-    std::process::exit(exit_code);
+        let status = std::process::Command::new(&new_cmd[0])
+            .args(&new_cmd[1..])
+            .status()
+            .with_context(|| format!("Failed to execute: {}", new_cmd[0]))?;
+
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 // Pull the body from -d, --data, or --data-raw flags.

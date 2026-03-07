@@ -3,6 +3,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
+use zeroize::Zeroizing;
 
 pub fn generate_keypair() -> (SigningKey, VerifyingKey) {
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -37,14 +38,17 @@ pub fn decode_public_key(encoded: &str) -> Result<VerifyingKey> {
 }
 
 pub fn encode_private_key(signing_key: &SigningKey) -> String {
-    BASE64.encode(signing_key.to_bytes())
+    let key_bytes = Zeroizing::new(signing_key.to_bytes());
+    BASE64.encode(&*key_bytes)
 }
 
 pub fn decode_private_key(encoded: &str) -> Result<SigningKey> {
-    let bytes = BASE64.decode(encoded).context("Invalid base64 in private key")?;
-    let key_bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Private key must be 32 bytes"))?;
+    let bytes = Zeroizing::new(BASE64.decode(encoded).context("Invalid base64 in private key")?);
+    if bytes.len() != 32 {
+        anyhow::bail!("Private key must be 32 bytes");
+    }
+    let mut key_bytes = Zeroizing::new([0u8; 32]);
+    key_bytes.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&key_bytes))
 }
 
