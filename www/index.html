@@ -3,19 +3,77 @@
 <head>
 	<meta charset="UTF-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+	<!-- Primary meta -->
 	<title>atomic — Domain identity for AI agents</title>
-	<meta name="description" content="One binary gives your AI agent a domain-bound keypair, signed requests, an encrypted vault, and a deposit box for receiving secrets. No cloud, no accounts." />
+	<meta name="description" content="One binary gives your AI agent a domain-bound Ed25519 keypair, signed requests, an encrypted vault, and a deposit box for receiving secrets. Open source, self-hosted, no cloud accounts." />
+	<meta name="keywords" content="AI agent identity, agent authentication, Ed25519, domain identity, agent.json, request signing, encrypted vault, deposit box, open source, Rust" />
+	<meta name="author" content="Ploton Labs, Inc" />
+	<link rel="canonical" href="https://atomic.bond/" />
+
+	<!-- Open Graph -->
+	<meta property="og:type" content="website" />
+	<meta property="og:url" content="https://atomic.bond/" />
+	<meta property="og:title" content="atomic — Domain identity for AI agents" />
+	<meta property="og:description" content="One binary gives your AI agent a domain-bound Ed25519 keypair, signed requests, an encrypted vault, and a deposit box. Open source, self-hosted." />
+	<meta property="og:site_name" content="atomic" />
+	<meta property="og:image" content="https://atomic.bond/og.png" />
+	<meta property="og:image:width" content="1200" />
+	<meta property="og:image:height" content="630" />
+	<meta property="og:locale" content="en_US" />
+
+	<!-- Twitter Card -->
+	<meta name="twitter:card" content="summary_large_image" />
+	<meta name="twitter:title" content="atomic — Domain identity for AI agents" />
+	<meta name="twitter:description" content="One binary gives your AI agent a domain-bound Ed25519 keypair, signed requests, an encrypted vault, and a deposit box." />
+	<meta name="twitter:image" content="https://atomic.bond/og.png" />
+	<meta name="twitter:site" content="@plotonai" />
+
+	<!-- Favicon -->
+	<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+	<link rel="icon" href="/favicon.ico" sizes="32x32" type="image/x-icon" />
+	<link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+
+	<!-- Fonts -->
 	<link rel="preconnect" href="https://fonts.googleapis.com" />
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet" />
-	<link rel="stylesheet" href="style.css" />
+
+	<!-- Styles -->
+	<link rel="stylesheet" href="/style.css" />
+
+	<!-- Structured data -->
+	<script type="application/ld+json">
+	{
+		"@context": "https://schema.org",
+		"@type": "SoftwareApplication",
+		"name": "atomic",
+		"url": "https://atomic.bond",
+		"description": "Domain identity for AI agents. One binary gives your agent a domain-bound Ed25519 keypair, signed requests, an encrypted vault, and a deposit box for receiving secrets.",
+		"applicationCategory": "DeveloperApplication",
+		"operatingSystem": "Linux, macOS",
+		"license": "https://opensource.org/licenses/MIT",
+		"offers": {
+			"@type": "Offer",
+			"price": "0",
+			"priceCurrency": "USD"
+		},
+		"author": {
+			"@type": "Organization",
+			"name": "Ploton Labs, Inc",
+			"url": "https://ploton.ai"
+		},
+		"codeRepository": "https://github.com/plotondev/atomic",
+		"programmingLanguage": "Rust"
+	}
+	</script>
 </head>
 <body>
 
 	<!-- Nav -->
 	<header class="nav">
-		<nav class="nav-inner">
-			<a href="/" class="nav-brand">atomic</a>
+		<nav class="nav-inner" aria-label="Main navigation">
+			<a href="/" class="nav-brand" aria-label="atomic home">atomic</a>
 			<div class="nav-links">
 				<a href="https://github.com/plotondev/atomic" class="nav-link">GitHub</a>
 				<a href="https://github.com/plotondev/atomic#cli" class="nav-link">Docs</a>
@@ -34,8 +92,10 @@
 			Your agent gets an Ed25519 keypair bound to its domain, a public identity document at <code class="ic">/.well-known/agent.json</code>, an encrypted vault, and a deposit box for receiving secrets. One binary, ~4MB, runs on the same box as the agent.
 		</p>
 
-		<pre class="code-block"><code>curl -fsSL atomic.bond/install | sh
-atomic init --domain fin.acme.com</code></pre>
+		<pre class="code-block"><code><span class="code-comment"># Download from GitHub releases</span>
+curl -fsSL https://github.com/plotondev/atomic/releases/latest/download/atomic-$(uname -m)-$(uname -s | tr A-Z a-z) -o atomic
+chmod +x atomic
+./atomic init --domain fin.acme.com</code></pre>
 
 		<div class="cta-row">
 			<a href="https://github.com/plotondev/atomic/releases" class="cta-btn">Download</a>
@@ -45,7 +105,7 @@ atomic init --domain fin.acme.com</code></pre>
 		<!-- agent.json -->
 		<hr class="section-rule" />
 
-		<h2 class="section-heading">agent.json</h2>
+		<h2 class="section-heading" id="agent-json">agent.json</h2>
 		<p class="section-body">
 			Every agent publishes its public key at a well-known URL. The domain is the identity.
 		</p>
@@ -69,7 +129,7 @@ atomic init --domain fin.acme.com</code></pre>
 		<!-- Deposit box -->
 		<hr class="section-rule" />
 
-		<h2 class="section-heading">Deposit box</h2>
+		<h2 class="section-heading" id="deposit-box">Deposit box</h2>
 		<p class="section-body">
 			The agent needs an API key. Instead of pasting it into a <code class="ic">.env</code>:
 		</p>
@@ -100,7 +160,7 @@ python agent.py</code></pre>
 		<!-- Magic links -->
 		<hr class="section-rule" />
 
-		<h2 class="section-heading">Magic links</h2>
+		<h2 class="section-heading" id="magic-links">Magic links</h2>
 		<p class="section-body">
 			Domain verification, like DNS TXT records but over HTTP. A service gives the agent a code, the agent hosts it, the service checks.
 		</p>
@@ -118,7 +178,7 @@ $ curl https://fin.acme.com/m/VERIFY_ABC123
 		<!-- Request signing -->
 		<hr class="section-rule" />
 
-		<h2 class="section-heading">Request signing</h2>
+		<h2 class="section-heading" id="signing">Request signing</h2>
 		<p class="section-body">
 			Every outgoing request gets an Ed25519 signature. The receiving service verifies against the public key in <code class="ic">agent.json</code>.
 		</p>
@@ -141,7 +201,7 @@ pub_key.verify(base64.b64decode(signature), f"{sig_time}.{body}".encode())</code
 		<!-- Why not JWTs -->
 		<hr class="section-rule" />
 
-		<h2 class="section-heading">Why not JWTs?</h2>
+		<h2 class="section-heading" id="why-not-jwts">Why not JWTs?</h2>
 		<p class="section-body">
 			When a human logs into a service, the service issues a token. The agent carries it around, sends it on every request, refreshes it when it expires. Agents don't need that. An agent with a keypair can prove itself on every request by signing it.
 		</p>
@@ -174,7 +234,7 @@ pub_key.verify(base64.b64decode(signature), f"{sig_time}.{body}".encode())</code
 		<!-- Security -->
 		<hr class="section-rule" />
 
-		<h2 class="section-heading">Security</h2>
+		<h2 class="section-heading" id="security">Security</h2>
 		<p class="section-body">
 			Private key stored at 600 permissions, never leaves the box. Vault uses AES-256-GCM with a key derived from the private key via HKDF — separate from the signing key.
 		</p>
@@ -188,10 +248,11 @@ pub_key.verify(base64.b64decode(signature), f"{sig_time}.{body}".encode())</code
 		<!-- Install -->
 		<hr class="section-rule" />
 
-		<h2 class="section-heading">Install</h2>
+		<h2 class="section-heading" id="install">Install</h2>
 
-		<pre class="code-block"><code><span class="code-comment"># One-line install</span>
-curl -fsSL atomic.bond/install | sh
+		<pre class="code-block"><code><span class="code-comment"># Download the latest release</span>
+curl -fsSL https://github.com/plotondev/atomic/releases/latest/download/atomic-$(uname -m)-$(uname -s | tr A-Z a-z) -o atomic
+chmod +x atomic && sudo mv atomic /usr/local/bin/
 
 <span class="code-comment"># Or build from source</span>
 git clone https://github.com/plotondev/atomic.git
