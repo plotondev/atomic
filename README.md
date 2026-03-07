@@ -48,6 +48,25 @@ sk_live_abc123
 
 The URL is Ed25519-signed, works exactly once (nonce-tracked), and caps out at 24 hours. The secret is AES-256-GCM encrypted before it hits disk.
 
+Once a secret is deposited, the agent can use it directly from shell:
+
+```bash
+# Use a secret inline
+curl -H "Authorization: Bearer $(atomic vault get stripe_key)" https://api.stripe.com/v1/charges
+
+# Export to environment
+export OPENAI_API_KEY=$(atomic vault get openai_key)
+python agent.py
+
+# List what's in the vault
+$ atomic vault list
+openai_key
+stripe_key
+db_password
+```
+
+No `.env` files on disk, no secrets in shell history. The agent reads from the vault at runtime.
+
 Deposits are logged with who sent them:
 
 ```bash
