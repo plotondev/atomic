@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, State},
-    http::{header, StatusCode},
+    extract::{DefaultBodyLimit, Path, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -20,7 +22,23 @@ pub struct AppState {
     pub verifying_key: ed25519_dalek::VerifyingKey,
     pub vault_key: [u8; 32],
     pub db: std::sync::Mutex<rusqlite::Connection>,
+    pub tls_active: bool,
 }
+
+#[derive(Serialize)]
+struct DepositResponse {
+    status: &'static str,
+    label: String,
+}
+
+#[derive(Serialize)]
+struct MagicLinkResponse {
+    status: &'static str,
+    code: String,
+}
+
+/// Max deposit body size: 1 MB
+const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 pub async fn run_server(credentials: Credentials) -> Result<()> {
     let agent_json_path = config::agent_json_path()?;
@@ -36,11 +54,14 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], credentials.port));
     let tls_mode = TlsMode::from_credentials(&credentials);
 
+    let tls_active = !matches!(tls_mode, TlsMode::None);
+
     let state = Arc::new(AppState {
         agent_json_cached,
         verifying_key,
         vault_key,
         db: std::sync::Mutex::new(db_conn),
+        tls_active,
     });
 
     // Background task: clean expired magic links + old deposit nonces every hour
@@ -71,6 +92,11 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .route("/d/{token}", post(handle_deposit))
         .route("/m/{code}", get(handle_magic_link))
         .fallback(handle_404)
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
         .layer(cors)
         .with_state(state);
 
@@ -156,7 +182,7 @@ async fn handle_deposit(
     };
 
     if body.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Empty body").into_response();
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // DB operations in spawn_blocking
@@ -189,10 +215,11 @@ async fn handle_deposit(
     let _ = append_deposit_log(&label);
     info!("Deposit received: '{label}'");
 
+    let resp = DepositResponse { status: "deposited", label };
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
-        format!(r#"{{"status":"deposited","label":"{label}"}}"#),
+        serde_json::to_string(&resp).unwrap(),
     )
         .into_response()
 }
@@ -211,10 +238,11 @@ async fn handle_magic_link(
 
     match result {
         Ok(Ok(Some(verified_code))) => {
+            let resp = MagicLinkResponse { status: "verified", code: verified_code };
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
-                format!(r#"{{"status":"verified","code":"{verified_code}"}}"#),
+                serde_json::to_string(&resp).unwrap(),
             )
                 .into_response()
         }
@@ -248,6 +276,34 @@ fn append_deposit_log(label: &str) -> Result<()> {
 
 async fn handle_404() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+async fn security_headers(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    if state.tls_active {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+        );
+    }
+    resp
 }
 
 async fn shutdown_signal() {

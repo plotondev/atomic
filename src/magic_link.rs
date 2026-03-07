@@ -6,7 +6,8 @@ use crate::deposit::parse_duration;
 
 pub fn host(code: &str, expires: &str) -> Result<()> {
     let duration = parse_duration(expires)?;
-    let expires_at = chrono::Utc::now().timestamp() + duration.as_secs() as i64;
+    let expires_at = chrono::Utc::now().timestamp()
+        + i64::try_from(duration.as_secs()).map_err(|_| anyhow::anyhow!("Duration too large"))?;
 
     let conn = db::open()?;
     conn.execute(
