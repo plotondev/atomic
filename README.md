@@ -109,6 +109,31 @@ pub_key.verify(base64.b64decode(signature), f"{sig_time}.{body}".encode())
 
 Four lines. Fetch the public key, check the signature.
 
+## Why not JWTs?
+
+When a human logs into a service, the service issues a token -- a JWT, a session cookie, whatever. The token is a delegated credential: the service says "I checked your password, here's proof you can carry around." Every request sends the token, the service validates its own signature.
+
+Agents don't need that. An agent with a keypair can prove itself on every request by signing it. The service doesn't issue anything -- it just checks the signature against the public key at the agent's domain.
+
+```
+Human auth:
+  1. Send password → service verifies → service gives you a JWT
+  2. Every request: send JWT → service checks its own signature
+  3. Token expires → re-authenticate
+
+Agent auth (Atomic):
+  1. Sign the request with private key
+  2. Service fetches public key from agent.json (cached)
+  3. Service checks Ed25519 signature
+  4. No token to store, refresh, or expire
+```
+
+The practical difference: the agent has nothing to manage. No token storage, no refresh logic. The private key is the only credential it needs, and it never leaves the box.
+
+A service that wants extra assurance can layer a magic link challenge on top of the signature check at signup -- verify the sig, then confirm domain control, then create an internal account for `fin.acme.com`. After that, subsequent requests are just signature checks against a cached public key.
+
+Performance-wise, JWT verification is a single HMAC check while Ed25519 verify costs more. But "more" here means microseconds, and the public key only changes on rotation so it caches well. It's not where your latency lives.
+
 ## CLI
 
 ```
