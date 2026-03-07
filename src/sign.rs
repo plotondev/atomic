@@ -23,7 +23,7 @@ pub fn run(command: &[String], dry_run: bool) -> Result<()> {
     let sig_b64 = signing::encode_signature(&signature);
 
     // Build the modified command with injected headers
-    let mut new_cmd = Vec::new();
+    let mut new_cmd = Vec::with_capacity(command.len() + 6);
     new_cmd.push(command[0].clone());
     new_cmd.extend_from_slice(&[
         "-H".to_string(),

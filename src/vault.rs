@@ -23,9 +23,11 @@ pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<String>> {
     let mut stmt = conn
         .prepare("SELECT value FROM vault_secrets WHERE label = ?1")
         .context("Failed to prepare query")?;
-    let result: Option<Vec<u8>> = stmt
-        .query_row(rusqlite::params![label], |row| row.get(0))
-        .ok();
+    let result: Option<Vec<u8>> = match stmt.query_row(rusqlite::params![label], |row| row.get(0)) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e).context("Failed to query vault"),
+    };
     match result {
         Some(encrypted) => {
             let plaintext = crypto_vault::decrypt(vault_key, &encrypted)?;
@@ -123,7 +125,7 @@ mod tests {
     }
 
     fn test_key() -> [u8; 32] {
-        cv::derive_vault_key(&[42u8; 32]).unwrap()
+        *cv::derive_vault_key(&[42u8; 32]).unwrap()
     }
 
     #[test]

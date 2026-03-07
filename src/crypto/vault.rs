@@ -6,14 +6,16 @@ use anyhow::{Context, Result};
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 const NONCE_SIZE: usize = 12;
+const HKDF_SALT: &[u8] = b"atomic-v1";
 
-// HKDF with "atomic-vault" context, so the vault key differs from the signing key.
-pub fn derive_vault_key(private_key_bytes: &[u8]) -> Result<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(None, private_key_bytes);
-    let mut key = [0u8; 32];
-    hk.expand(b"atomic-vault", &mut key)
+// HKDF with salt and "atomic-vault" context, so the vault key differs from the signing key.
+pub fn derive_vault_key(private_key_bytes: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), private_key_bytes);
+    let mut key = Zeroizing::new([0u8; 32]);
+    hk.expand(b"atomic-vault", key.as_mut())
         .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
     Ok(key)
 }
@@ -88,9 +90,9 @@ mod tests {
     fn derive_vault_key_is_deterministic() {
         let private_key = [1u8; 32];
         let key = derive_vault_key(&private_key).unwrap();
-        assert_ne!(key, [0u8; 32]);
+        assert_ne!(*key, [0u8; 32]);
         let key2 = derive_vault_key(&private_key).unwrap();
-        assert_eq!(key, key2);
+        assert_eq!(*key, *key2);
     }
 
     #[test]

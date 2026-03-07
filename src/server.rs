@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
+use zeroize::Zeroizing;
 
 use crate::config;
 use crate::credentials::Credentials;
@@ -20,9 +21,17 @@ use crate::tls::TlsMode;
 pub struct AppState {
     pub agent_json_cached: bytes::Bytes,
     pub verifying_key: ed25519_dalek::VerifyingKey,
-    pub vault_key: [u8; 32],
+    /// Zeroized on drop. Derived from the private key via HKDF.
+    vault_key: Zeroizing<[u8; 32]>,
+    /// Only lock inside `spawn_blocking` — never hold across an `.await`.
     pub db: std::sync::Mutex<rusqlite::Connection>,
     pub tls_active: bool,
+}
+
+impl AppState {
+    pub fn vault_key(&self) -> &[u8; 32] {
+        &self.vault_key
+    }
 }
 
 #[derive(Serialize)]
@@ -48,7 +57,10 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
 
     let verifying_key = credentials.verifying_key()?;
     let signing_key = credentials.signing_key()?;
-    let vault_key = crate::crypto::vault::derive_vault_key(&signing_key.to_bytes())?;
+    let mut sk_bytes = Zeroizing::new(signing_key.to_bytes());
+    let vault_key = crate::crypto::vault::derive_vault_key(&sk_bytes)?;
+    sk_bytes.iter_mut().for_each(|b| *b = 0); // belt-and-suspenders
+    drop(sk_bytes);
     let db_conn = crate::db::open()?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], credentials.port));
@@ -101,8 +113,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .with_state(state);
 
     let pid_path = config::pid_path()?;
-    std::fs::write(&pid_path, std::process::id().to_string())
-        .with_context(|| format!("Failed to write PID file {}", pid_path.display()))?;
+    config::write_secure(&pid_path, std::process::id().to_string().as_bytes())?;
 
     match tls_mode {
         TlsMode::None => {
@@ -118,31 +129,20 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 .await
                 .context("Server error")?;
         }
-        TlsMode::Auto { .. } => {
+        TlsMode::Auto { .. } | TlsMode::Custom { .. } => {
+            let is_auto = matches!(tls_mode, TlsMode::Auto { .. });
             let rustls_config = crate::tls::resolve_rustls_config(&tls_mode).await?;
-            crate::tls::spawn_renewal_watcher(rustls_config.clone());
+            if is_auto {
+                crate::tls::spawn_renewal_watcher(rustls_config.clone());
+            }
             let handle = axum_server::Handle::new();
             let shutdown_handle = handle.clone();
             tokio::spawn(async move {
                 shutdown_signal().await;
                 shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
             });
-            info!("Listening on {} (HTTPS/acme.sh, PID {})", addr, std::process::id());
-            axum_server::bind_rustls(addr, rustls_config)
-                .handle(handle)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .context("TLS server error")?;
-        }
-        TlsMode::Custom { .. } => {
-            let rustls_config = crate::tls::resolve_rustls_config(&tls_mode).await?;
-            let handle = axum_server::Handle::new();
-            let shutdown_handle = handle.clone();
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
-            });
-            info!("Listening on {} (HTTPS/custom cert, PID {})", addr, std::process::id());
+            let mode_label = if is_auto { "acme.sh" } else { "custom cert" };
+            info!("Listening on {} (HTTPS/{}, PID {})", addr, mode_label, std::process::id());
             axum_server::bind_rustls(addr, rustls_config)
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())
@@ -178,7 +178,7 @@ async fn handle_deposit(
     body: String,
 ) -> Response {
     let verifying_key = state.verifying_key;
-    let vault_key = state.vault_key;
+    let vault_key = *state.vault_key();
 
     // Verify signature + expiry (no DB needed yet)
     let payload = match crate::deposit::verify_signature(&token, &verifying_key) {
@@ -233,12 +233,10 @@ async fn handle_deposit(
     info!("Deposit received: '{label}'");
 
     let resp = DepositResponse { status: "deposited", label };
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&resp).unwrap(),
-    )
-        .into_response()
+    match serde_json::to_string(&resp) {
+        Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 async fn handle_magic_link(
@@ -256,12 +254,10 @@ async fn handle_magic_link(
     match result {
         Ok(Ok(Some(verified_code))) => {
             let resp = MagicLinkResponse { status: "verified", code: verified_code };
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::to_string(&resp).unwrap(),
-            )
-                .into_response()
+            match serde_json::to_string(&resp) {
+                Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
         }
         Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {

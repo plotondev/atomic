@@ -61,7 +61,7 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 # Misc
 bytes = "1"
 dirs = "6"
-subtle = "2"
+zeroize = { version = "1.8.2", features = ["derive"] }
 
 [profile.release]
 opt-level = "z"

@@ -22,6 +22,12 @@ pub fn run(
     if !domain.contains('.') {
         bail!("Domain must contain at least one dot (e.g., agent.example.com)");
     }
+    if domain.starts_with('.') || domain.ends_with('.') || domain.starts_with('-') {
+        bail!("Domain must not start or end with a dot or hyphen");
+    }
+    if domain.contains("..") {
+        bail!("Domain must not contain consecutive dots");
+    }
     if !domain
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
@@ -29,7 +35,12 @@ pub fn run(
         bail!("Domain contains invalid characters (only alphanumeric, hyphens, and dots allowed)");
     }
 
-    // Validate TLS cert/key paths if provided
+    // Validate TLS cert/key must be provided as a pair
+    match (&tls_cert, &tls_key) {
+        (Some(_), None) => bail!("--tls-cert requires --tls-key"),
+        (None, Some(_)) => bail!("--tls-key requires --tls-cert"),
+        _ => {}
+    }
     if let Some(ref cert_path) = tls_cert {
         if !std::path::Path::new(cert_path).exists() {
             bail!("TLS certificate file not found: {cert_path}");

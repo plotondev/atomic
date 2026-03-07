@@ -59,6 +59,11 @@ pub async fn resolve_rustls_config(mode: &TlsMode) -> Result<RustlsConfig> {
 
 // Install acme.sh if not present, issue cert, install to ~/.atomic/tls/
 fn issue_cert(domain: &str, tls_dir: &Path) -> Result<()> {
+    // Defense-in-depth: validate domain even though init.rs already checks
+    if !domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+        anyhow::bail!("Domain contains invalid characters: {domain}");
+    }
+
     ensure_acme_sh()?;
     let acme_sh = acme_sh_path()?;
 
@@ -118,16 +123,36 @@ fn ensure_acme_sh() -> Result<()> {
     let home = dirs::home_dir().context("No home directory")?;
     let acme_home = home.join(".acme.sh");
 
-    let output = Command::new("sh")
-        .args([
-            "-c",
-            &format!(
-                "curl -fsSL https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh | sh -s -- --install-online --home {}",
-                acme_home.display()
-            ),
-        ])
+    // Download the script first, then run it with proper argument separation
+    // to avoid shell injection via the home directory path.
+    let download = Command::new("curl")
+        .args(["-fsSL", "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh"])
         .output()
-        .context("Failed to install acme.sh. Is curl available?")?;
+        .context("Failed to download acme.sh. Is curl available?")?;
+
+    if !download.status.success() {
+        let stderr = String::from_utf8_lossy(&download.stderr);
+        anyhow::bail!("Failed to download acme.sh: {stderr}");
+    }
+
+    let output = Command::new("sh")
+        .arg("-s")
+        .arg("--")
+        .arg("--install-online")
+        .arg("--home")
+        .arg(&acme_home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                stdin.write_all(&download.stdout)?;
+            }
+            child.wait_with_output()
+        })
+        .context("Failed to install acme.sh")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

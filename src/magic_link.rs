@@ -5,6 +5,9 @@ use crate::db;
 use crate::deposit::parse_duration;
 
 pub fn host(code: &str, expires: &str) -> Result<()> {
+    if code.len() < 8 {
+        anyhow::bail!("Code must be at least 8 characters (got {}). Use a longer code to prevent brute-force.", code.len());
+    }
     let duration = parse_duration(expires)?;
     let expires_at = chrono::Utc::now().timestamp()
         + i64::try_from(duration.as_secs()).map_err(|_| anyhow::anyhow!("Duration too large"))?;
