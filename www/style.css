@@ -73,11 +73,14 @@ body {
 }
 
 .nav-brand {
-	font-size: 1rem;
-	font-weight: 600;
-	color: var(--color-primary);
+	display: flex;
+	align-items: center;
 	text-decoration: none;
-	letter-spacing: -0.025em;
+}
+
+.nav-logo {
+	height: 24px;
+	width: auto;
 }
 
 .nav-links {
