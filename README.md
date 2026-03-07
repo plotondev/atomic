@@ -1,19 +1,15 @@
 # atomic
 
-Domain based identity for AI agents.
+Domain identity for AI agents.
 
-Atomic ties an agent's identity to its domain. `fin.acme.com` becomes the agent's identity the same way an email address is yours.
-
-Humans have email addresses. You see `alice@acme.com` and you know who you're dealing with -- you can send her credentials, verify her messages, trust her identity.
-
-Agents have nothing. They run on servers with no way to prove who they are. Credentials get pasted into `.env` files. Outgoing requests are unverifiable. Moving to a new server means starting over.
+`fin.acme.com` is the agent. The domain is the identity, same idea as email for humans. Atomic gives the agent a keypair, publishes the public key at `/.well-known/agent.json`, and runs a small HTTPS server for receiving secrets and proving domain ownership.
 
 ```bash
 curl -fsSL atomic.bond/install | sh
 atomic init --domain fin.acme.com
 ```
 
-Your agent now has a keypair, a public identity at `/.well-known/agent.json`, an encrypted vault, and a deposit box for receiving secrets. Single binary, runs on the same server as your agent.
+One static binary (~4MB), zero cloud accounts. Runs on the same box as the agent.
 
 ## agent.json
 
@@ -23,53 +19,59 @@ curl https://fin.acme.com/.well-known/agent.json
 
 ```json
 {
-	"v": 1,
-	"id": "fin.acme.com",
-	"name": "fin.acme.com",
-	"public_key": "ed25519:m2UrN...",
-	"status": "active",
-	"deposit": "https://fin.acme.com/d/",
-	"created_at": "2026-03-07T12:00:00Z"
+  "v": 1,
+  "id": "fin.acme.com",
+  "name": "fin.acme.com",
+  "public_key": "ed25519:m2UrN...",
+  "status": "active",
+  "deposit": "https://fin.acme.com/d/",
+  "created_at": "2026-03-07T12:00:00Z"
 }
 ```
 
-Anyone can look up your agent's public key. The root domain redirects here.
+`GET /` redirects here. The public key is how other services verify this agent's signatures.
 
 ## Deposit box
 
-Your agent needs a Stripe key. Instead of someone SSHing in and editing env vars:
+The agent needs an API key. Instead of pasting it into a `.env`:
 
 ```bash
 $ atomic deposit-url --label stripe_key --expires 10m
 https://fin.acme.com/d/eyJsYWJlbCI6...Rk4
 
 $ curl -X POST "https://fin.acme.com/d/eyJsYWJlbCI6...Rk4" -d "sk_live_abc123"
-{"status": "deposited", "label": "stripe_key"}
+{"status":"deposited","label":"stripe_key"}
 
 $ atomic vault get stripe_key
 sk_live_abc123
 ```
 
-URL works once (nonce-based replay prevention), expires in minutes, secret is AES-256-GCM encrypted in the vault. Every deposit is logged.
+The URL is Ed25519-signed, works exactly once (nonce-tracked), and caps out at 24 hours. The secret is AES-256-GCM encrypted before it hits disk.
+
+Deposits are logged with who sent them:
+
+```bash
+$ atomic deposits
+2026-03-07T21:45:00+00:00  stripe_key
+  IP:         203.0.113.42
+  User-Agent: curl/8.5.0
+
+$ atomic deposits --label stripe_key
+```
 
 ## Magic links
 
-When a service lets agents sign up, it needs to verify the agent actually controls the domain it claims. Magic links solve this the same way DNS TXT records verify domain ownership, but over HTTP.
+Domain verification, like DNS TXT records but over HTTP. A service gives the agent a code, the agent hosts it, the service checks.
 
 ```bash
-# Service gives the agent a verification code: "VERIFY_ABC123"
-
-# Agent hosts it:
 $ atomic magic-link host VERIFY_ABC123 --expires 5m
 https://fin.acme.com/m/VERIFY_ABC123
 
-# Agent tells the service: "check my domain"
-
-# Service fetches https://fin.acme.com/m/VERIFY_ABC123
-{"status": "verified", "code": "VERIFY_ABC123"}
+$ curl https://fin.acme.com/m/VERIFY_ABC123
+{"status":"verified","code":"VERIFY_ABC123"}
 ```
 
-The code is one-time use (gone after the first GET) and expires in minutes.
+One-time use, gone after the first GET, expires in minutes.
 
 ## Request signing
 
@@ -77,27 +79,16 @@ The code is one-time use (gone after the first GET) and expires in minutes.
 $ atomic sign -- curl -X POST https://partner.api.com/transfer -d '{"amount": 5000}'
 ```
 
-Adds `X-Agent-Id`, `X-Agent-Sig`, and `X-Agent-Sig-Time` headers. The receiving service fetches the agent's public key from `agent.json` and checks the Ed25519 signature:
+Adds `X-Agent-Id`, `X-Agent-Sig`, and `X-Agent-Sig-Time` headers. Verification on the receiving end:
 
 ```python
-# Python -- other languages are similar
 agent = requests.get(f"https://{agent_id}/.well-known/agent.json").json()
 key_bytes = base64.b64decode(agent["public_key"].removeprefix("ed25519:"))
 pub_key = Ed25519PublicKey.from_public_bytes(key_bytes)
 pub_key.verify(base64.b64decode(signature), f"{sig_time}.{body}".encode())
 ```
 
-The receiver only needs the public key from `agent.json` and a signature check. No SDK.
-
-## Examples
-
-**Credential handoff** -- ops generates a deposit URL, sends it to whoever has the key, they POST it. The agent picks it up from its vault. No `.env`, no Slack DMs, no SSH.
-
-**Signed API calls** -- your agent calls a partner service. The partner verifies the request came from `fin.acme.com` by checking the signature against the public key in `agent.json`.
-
-**Multiple agents** -- `billing.acme.com`, `support.acme.com`, `research.acme.com`. Each gets its own identity, vault, and deposit box. They verify each other the same way external services do.
-
-**Key rotation** -- generate a new deposit URL, POST the new credential, agent reads it from vault. No restart needed.
+Four lines. Fetch the public key, check the signature.
 
 ## CLI
 
@@ -111,7 +102,7 @@ atomic status                                      Server + vault summary
 atomic verify <domain>                             Check another agent
 
 atomic deposit-url --label <name> --expires <t>    Create deposit URL
-atomic deposits                                    Audit log
+atomic deposits [--label <name>]                   Deposit audit log
 
 atomic magic-link host <code> --expires <t>        Host a verification code
 atomic magic-link list                             Show active codes
@@ -121,7 +112,7 @@ atomic vault get <label>                           Read a secret
 atomic vault list                                  List labels
 atomic vault delete <label>                        Remove a secret
 
-atomic sign [--dry-run] -- <command>                Sign outgoing request
+atomic sign [--dry-run] -- <command>               Sign outgoing request
 atomic key rotate                                  Rotate keypair
 atomic key revoke                                  Revoke identity
 
@@ -132,13 +123,23 @@ atomic service status                              Show service status
 
 ## TLS
 
-Let's Encrypt by default. Or bring your own cert, or skip TLS if you're behind a proxy.
+Auto-TLS via acme.sh (Let's Encrypt) by default. BYO cert or skip TLS if you're behind a proxy.
 
 ```bash
-atomic init --domain fin.acme.com
-atomic init --domain fin.acme.com --tls-cert cert.pem --tls-key key.pem
-atomic init --domain fin.acme.com --port 8787 --no-tls
+atomic init --domain fin.acme.com                                          # auto-TLS
+atomic init --domain fin.acme.com --tls-cert cert.pem --tls-key key.pem    # your cert
+atomic init --domain fin.acme.com --port 8787 --no-tls                     # behind proxy
 ```
+
+HSTS is set when TLS is active.
+
+## Security
+
+Private key stored at 600 permissions, never leaves the box. Vault uses AES-256-GCM with a key derived from the private key via HKDF -- separate from the signing key.
+
+Deposit tokens are Ed25519-signed with a nonce and a 24h max TTL. Every failure returns 404 regardless of the reason, so you can't probe for valid tokens. Body size is capped at 1MB.
+
+All responses get `nosniff`, `no-store`, and `no-referrer` headers. HSTS (2-year max-age) when TLS is on. SQL is parameterized everywhere (SQLite in WAL mode).
 
 ## Files
 
@@ -146,29 +147,37 @@ atomic init --domain fin.acme.com --port 8787 --no-tls
 ~/.atomic/
   credentials       domain + keypair (600 perms)
   agent.json        public identity document
-  atomic.db         SQLite database (vault, deposits, magic links)
-  deposits.log      audit trail
-  atomic.pid        PID file
+  atomic.db         SQLite (vault, deposits, magic links)
+  atomic.pid        server PID
   atomic.log        server logs
   tls/              certificates
 ```
 
-## What's next
-
-- [x] Magic links -- service gives the agent a code to host at `agent.acme.com/m/{code}`, then verifies it's there. Domain ownership proof over HTTP.
-- [ ] NS delegation + hosted subdomains -- `atomic init` prints DNS records. Later, `atomic init --hosted` provisions a subdomain under `atomic.bond`.
-- [ ] Agent email -- `fin.acme.com` gets `inbox@fin.acme.com`. Inbound and outbound, signed with the agent's key.
-- [ ] Capabilities -- declare what your agent can do in `agent.json`. Services check before granting access.
-- [ ] Approval flows -- agent needs permission, creates an approval request, human approves or denies via a link.
-- [ ] Agent-to-agent secrets -- encrypt with another agent's public key, deposit directly.
-- [ ] Dashboard -- web UI for identity, vault, deposits, and key rotation.
-
-## License
-
-MIT. PRs welcome.
+## Build
 
 ```bash
 git clone https://github.com/ploton/atomic.git
 cd atomic
-cargo build && cargo test
+cargo build --release    # ~4MB binary
+cargo test               # 65 tests
 ```
+
+Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`.
+
+## Roadmap
+
+- [x] Identity (agent.json + Ed25519)
+- [x] Deposit box (signed URLs, encrypted vault, audit log)
+- [x] Magic links (domain verification)
+- [x] Request signing
+- [x] Auto-TLS
+- [ ] NS delegation + hosted subdomains
+- [ ] Agent email
+- [ ] Capability declarations
+- [ ] Approval flows
+- [ ] Agent-to-agent secrets
+- [ ] Dashboard
+
+## License
+
+MIT
