@@ -115,20 +115,18 @@ When a human logs into a service, the service issues a token -- a JWT, a session
 
 Agents don't need that. An agent with a keypair can prove itself on every request by signing it. The service doesn't issue anything -- it just checks the signature against the public key at the agent's domain.
 
-```
-Human auth:
-  1. Send password → service verifies → service gives you a JWT
-  2. Every request: send JWT → service checks its own signature
-  3. Token expires → re-authenticate
+|                  | Human (JWT)                          | Agent (Atomic)                              |
+|------------------|--------------------------------------|---------------------------------------------|
+| **Identity**     | email + password                     | domain (`fin.acme.com`)                     |
+| **Signup**       | create account, get credentials      | sign request + magic link for domain proof  |
+| **Proof**        | service issues a JWT                 | agent signs every request with private key  |
+| **Each request** | send JWT, service checks it          | send signature, service checks agent.json   |
+| **Expiry**       | token expires, agent re-auths        | no token -- signatures are stateless        |
+| **Revocation**   | service invalidates the token        | agent.json status changes to `"revoked"`    |
+| **Rotation**     | service issues new token             | agent rotates keypair, agent.json updates   |
+| **Storage**      | agent stores token, handles refresh  | private key stays on disk, nothing to refresh |
 
-Agent auth (Atomic):
-  1. Sign the request with private key
-  2. Service fetches public key from agent.json (cached)
-  3. Service checks Ed25519 signature
-  4. No token to store, refresh, or expire
-```
-
-The practical difference: the agent has nothing to manage. No token storage, no refresh logic. The private key is the only credential it needs, and it never leaves the box.
+The practical difference: the agent has nothing to manage. No token storage, no refresh logic. The private key stays on the box and never gets sent over the wire.
 
 A service that wants extra assurance can layer a magic link challenge on top of the signature check at signup -- verify the sig, then confirm domain control, then create an internal account for `fin.acme.com`. After that, subsequent requests are just signature checks against a cached public key.
 
