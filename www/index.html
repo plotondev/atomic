@@ -92,10 +92,8 @@
 			Your agent gets an Ed25519 keypair bound to its domain, a public identity document at <code class="ic">/.well-known/agent.json</code>, an encrypted vault, and a deposit box for receiving secrets. One binary, ~4MB, runs on the same box as the agent.
 		</p>
 
-		<pre class="code-block"><code><span class="code-comment"># Download from GitHub releases</span>
-curl -fsSL https://github.com/plotondev/atomic/releases/latest/download/atomic-$(uname -m)-$(uname -s | tr A-Z a-z) -o atomic
-chmod +x atomic
-./atomic init --domain fin.acme.com</code></pre>
+		<pre class="code-block"><code>curl -fsSL atomic.bond/install | sh
+atomic init --domain fin.acme.com</code></pre>
 
 		<div class="cta-row">
 			<a href="https://github.com/plotondev/atomic/releases" class="cta-btn">Download</a>
@@ -250,9 +248,8 @@ pub_key.verify(base64.b64decode(signature), f"{sig_time}.{body}".encode())</code
 
 		<h2 class="section-heading" id="install">Install</h2>
 
-		<pre class="code-block"><code><span class="code-comment"># Download the latest release</span>
-curl -fsSL https://github.com/plotondev/atomic/releases/latest/download/atomic-$(uname -m)-$(uname -s | tr A-Z a-z) -o atomic
-chmod +x atomic && sudo mv atomic /usr/local/bin/
+		<pre class="code-block"><code><span class="code-comment"># One-line install</span>
+curl -fsSL atomic.bond/install | sh
 
 <span class="code-comment"># Or build from source</span>
 git clone https://github.com/plotondev/atomic.git

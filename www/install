@@ -1,0 +1,46 @@
+#!/bin/sh
+set -e
+
+REPO="plotondev/atomic"
+INSTALL_DIR="/usr/local/bin"
+
+# Detect OS
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+case "$OS" in
+    linux)  OS="linux" ;;
+    darwin) OS="macos" ;;
+    *)      echo "Unsupported OS: $OS" >&2; exit 1 ;;
+esac
+
+# Detect arch
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64|amd64)   ARCH="x86_64" ;;
+    aarch64|arm64)   ARCH="aarch64" ;;
+    *)               echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+
+BINARY="atomic-${ARCH}-${OS}"
+URL="https://github.com/${REPO}/releases/latest/download/${BINARY}"
+
+echo "Downloading atomic for ${OS}/${ARCH}..."
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$URL" -o /tmp/atomic
+elif command -v wget >/dev/null 2>&1; then
+    wget -q "$URL" -O /tmp/atomic
+else
+    echo "Error: curl or wget required" >&2
+    exit 1
+fi
+
+chmod +x /tmp/atomic
+
+if [ -w "$INSTALL_DIR" ]; then
+    mv /tmp/atomic "$INSTALL_DIR/atomic"
+else
+    echo "Installing to ${INSTALL_DIR} (requires sudo)..."
+    sudo mv /tmp/atomic "$INSTALL_DIR/atomic"
+fi
+
+echo "atomic installed to ${INSTALL_DIR}/atomic"
+atomic --version
