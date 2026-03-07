@@ -1,129 +1,164 @@
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeMap;
-use std::path::Path;
 
 use crate::crypto::vault as crypto_vault;
+use crate::db;
 
-// Labeled key-value secrets, encrypted as a single blob on disk.
-pub struct VaultStore {
-    secrets: BTreeMap<String, String>,
-    vault_key: [u8; 32],
-}
-
-impl VaultStore {
-    pub fn new(private_key_bytes: Vec<u8>) -> Self {
-        let vault_key = crypto_vault::derive_vault_key(&private_key_bytes)
-            .expect("Key derivation should not fail");
-        Self {
-            secrets: BTreeMap::new(),
-            vault_key,
-        }
-    }
-
-    pub fn load(path: &Path, private_key_bytes: &[u8]) -> Result<Self> {
-        let vault_key = crypto_vault::derive_vault_key(private_key_bytes)?;
-        let encrypted = std::fs::read(path)
-            .with_context(|| format!("Failed to read vault at {}", path.display()))?;
-
-        if encrypted.is_empty() {
-            return Ok(Self {
-                secrets: BTreeMap::new(),
-                vault_key,
-            });
-        }
-
-        let plaintext = crypto_vault::decrypt(&vault_key, &encrypted)?;
-        let secrets: BTreeMap<String, String> =
-            serde_json::from_slice(&plaintext).context("Failed to parse vault contents")?;
-
-        Ok(Self { secrets, vault_key })
-    }
-
-    // Write to .tmp then rename, so a crash mid-write doesn't corrupt the vault.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_vec(&self.secrets).context("Failed to serialize vault")?;
-        let encrypted = crypto_vault::encrypt(&self.vault_key, &json)?;
-
-        let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, &encrypted)
-            .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, path)
-            .with_context(|| format!("Failed to rename {} to {}", tmp_path.display(), path.display()))?;
-
-        Ok(())
-    }
-
-    pub fn set(&mut self, label: String, value: String) {
-        self.secrets.insert(label, value);
-    }
-
-    pub fn get(&self, label: &str) -> Option<&str> {
-        self.secrets.get(label).map(|s| s.as_str())
-    }
-
-    pub fn delete(&mut self, label: &str) -> bool {
-        self.secrets.remove(label).is_some()
-    }
-
-    pub fn labels(&self) -> Vec<&str> {
-        self.secrets.keys().map(|s| s.as_str()).collect()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.secrets.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.secrets.len()
-    }
-}
-
-pub fn load_vault() -> Result<(VaultStore, std::path::PathBuf)> {
-    let creds = crate::credentials::Credentials::load(&crate::config::credentials_path()?)?;
-    let signing_key = creds.signing_key()?;
-    let vault_path = crate::config::vault_path()?;
-    let store = VaultStore::load(&vault_path, &signing_key.to_bytes())?;
-    Ok((store, vault_path))
-}
-
-pub fn cmd_set(label: &str, value: &str) -> Result<()> {
-    let (mut store, vault_path) = load_vault()?;
-    store.set(label.to_string(), value.to_string());
-    store.save(&vault_path)?;
-    println!("Stored '{}'", label);
+pub fn vault_set_with_conn(conn: &rusqlite::Connection, label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
+    let encrypted = crypto_vault::encrypt(vault_key, value.as_bytes())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO vault_secrets (label, value) VALUES (?1, ?2)",
+        rusqlite::params![label, encrypted],
+    )
+    .context("Failed to store secret")?;
     Ok(())
 }
 
-pub fn cmd_get(label: &str) -> Result<()> {
-    let (store, _) = load_vault()?;
-    match store.get(label) {
+pub fn vault_set(label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
+    let conn = db::open()?;
+    vault_set_with_conn(&conn, label, value, vault_key)
+}
+
+pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<String>> {
+    let conn = db::open()?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM vault_secrets WHERE label = ?1")
+        .context("Failed to prepare query")?;
+    let result: Option<Vec<u8>> = stmt
+        .query_row(rusqlite::params![label], |row| row.get(0))
+        .ok();
+    match result {
+        Some(encrypted) => {
+            let plaintext = crypto_vault::decrypt(vault_key, &encrypted)?;
+            let value = String::from_utf8(plaintext).context("Vault value is not valid UTF-8")?;
+            Ok(Some(value))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn vault_list() -> Result<Vec<String>> {
+    let conn = db::open()?;
+    let mut stmt = conn
+        .prepare("SELECT label FROM vault_secrets ORDER BY label")
+        .context("Failed to prepare query")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("Failed to query vault labels")?;
+    let mut labels = Vec::new();
+    for row in rows {
+        labels.push(row?);
+    }
+    Ok(labels)
+}
+
+pub fn vault_delete(label: &str) -> Result<bool> {
+    let conn = db::open()?;
+    let deleted = conn
+        .execute(
+            "DELETE FROM vault_secrets WHERE label = ?1",
+            rusqlite::params![label],
+        )
+        .context("Failed to delete secret")?;
+    Ok(deleted > 0)
+}
+
+pub fn vault_count() -> Result<usize> {
+    let conn = db::open()?;
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vault_secrets", [], |row| row.get(0))?;
+    Ok(count as usize)
+}
+
+pub fn cmd_set(label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
+    if label.is_empty() || label.len() > 256 {
+        bail!("Label must be non-empty and at most 256 characters");
+    }
+    vault_set(label, value, vault_key)?;
+    println!("Stored '{label}'");
+    Ok(())
+}
+
+pub fn cmd_get(label: &str, vault_key: &[u8; 32]) -> Result<()> {
+    match vault_get(label, vault_key)? {
         Some(value) => {
-            print!("{}", value); // no trailing newline, so it works in $()
+            print!("{value}"); // no trailing newline, so it works in $()
             Ok(())
         }
-        None => bail!("Label '{}' not found in vault", label),
+        None => bail!("Label '{label}' not found in vault"),
     }
 }
 
 pub fn cmd_list() -> Result<()> {
-    let (store, _) = load_vault()?;
-    if store.is_empty() {
+    let labels = vault_list()?;
+    if labels.is_empty() {
         println!("Vault is empty");
         return Ok(());
     }
-    for label in store.labels() {
-        println!("{}", label);
+    for label in labels {
+        println!("{label}");
     }
     Ok(())
 }
 
 pub fn cmd_delete(label: &str) -> Result<()> {
-    let (mut store, vault_path) = load_vault()?;
-    if store.delete(label) {
-        store.save(&vault_path)?;
-        println!("Deleted '{}'", label);
+    if vault_delete(label)? {
+        println!("Deleted '{label}'");
     } else {
-        bail!("Label '{}' not found in vault", label);
+        bail!("Label '{label}' not found in vault");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::vault as cv;
+
+    fn test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE vault_secrets (label TEXT PRIMARY KEY, value BLOB NOT NULL);"
+        ).unwrap();
+        conn
+    }
+
+    fn test_key() -> [u8; 32] {
+        cv::derive_vault_key(&[42u8; 32]).unwrap()
+    }
+
+    #[test]
+    fn vault_set_get_roundtrip() {
+        let key = test_key();
+        let conn = test_db();
+        vault_set_with_conn(&conn, "api_key", "sk-12345", &key).unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM vault_secrets WHERE label = ?1").unwrap();
+        let encrypted: Vec<u8> = stmt.query_row(["api_key"], |row| row.get(0)).unwrap();
+        let decrypted = cv::decrypt(&key, &encrypted).unwrap();
+        assert_eq!(String::from_utf8(decrypted).unwrap(), "sk-12345");
+    }
+
+    #[test]
+    fn vault_set_overwrites() {
+        let key = test_key();
+        let conn = test_db();
+        vault_set_with_conn(&conn, "k", "v1", &key).unwrap();
+        vault_set_with_conn(&conn, "k", "v2", &key).unwrap();
+        let mut stmt = conn.prepare("SELECT value FROM vault_secrets WHERE label = ?1").unwrap();
+        let encrypted: Vec<u8> = stmt.query_row(["k"], |row| row.get(0)).unwrap();
+        let decrypted = cv::decrypt(&key, &encrypted).unwrap();
+        assert_eq!(String::from_utf8(decrypted).unwrap(), "v2");
+    }
+
+    #[test]
+    fn cmd_set_rejects_empty_label() {
+        let key = test_key();
+        assert!(cmd_set("", "val", &key).is_err());
+    }
+
+    #[test]
+    fn cmd_set_rejects_long_label() {
+        let key = test_key();
+        let label = "a".repeat(257);
+        assert!(cmd_set(&label, "val", &key).is_err());
+    }
 }

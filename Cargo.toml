@@ -15,10 +15,11 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 
 # Async
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal", "macros", "io-util", "process"] }
 
 # HTTP server
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 tower-http = { version = "0.6", features = ["cors"] }
 
 # Serialization
@@ -54,7 +55,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
 
+# Storage
+rusqlite = { version = "0.34", features = ["bundled"] }
+
 # Misc
+bytes = "1"
 dirs = "6"
 subtle = "2"
 
@@ -62,4 +67,5 @@ subtle = "2"
 opt-level = "z"
 lto = true
 codegen-units = 1
+panic = "abort"
 strip = true

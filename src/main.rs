@@ -3,16 +3,20 @@ mod cli;
 mod config;
 mod credentials;
 mod crypto;
+mod db;
 mod deposit;
 mod init;
+mod magic_link;
 mod server;
+mod sign;
+mod tls;
 mod vault;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use cli::{Cli, Command, KeyCommand, ServiceCommand, VaultCommand};
+use cli::{Cli, Command, KeyCommand, MagicLinkCommand, ServiceCommand, VaultCommand};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -27,10 +31,11 @@ async fn main() -> Result<()> {
             domain,
             port,
             no_tls,
+            tls_cert,
+            tls_key,
             force,
-            ..
         } => {
-            init::run(&domain, port, no_tls, force)?;
+            init::run(&domain, port, no_tls, tls_cert, tls_key, force)?;
         }
 
         Command::Serve => {
@@ -46,6 +51,25 @@ async fn main() -> Result<()> {
             }
             let pid_str = std::fs::read_to_string(&pid_path)?;
             let pid: i32 = pid_str.trim().parse().context("Invalid PID file")?;
+            if pid <= 0 {
+                let _ = std::fs::remove_file(&pid_path);
+                anyhow::bail!("Invalid PID {pid} in PID file (removed)");
+            }
+
+            // Verify the PID belongs to an atomic process before killing
+            let ps_output = std::process::Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "comm="])
+                .output();
+            if let Ok(output) = ps_output {
+                let comm = String::from_utf8_lossy(&output.stdout);
+                let comm = comm.trim();
+                if !comm.is_empty() && !comm.contains("atomic") {
+                    let _ = std::fs::remove_file(&pid_path);
+                    anyhow::bail!(
+                        "PID {pid} belongs to '{comm}', not atomic (stale PID file removed)"
+                    );
+                }
+            }
 
             // Send SIGTERM
             let status = std::process::Command::new("kill")
@@ -55,11 +79,11 @@ async fn main() -> Result<()> {
 
             if status.success() {
                 let _ = std::fs::remove_file(&pid_path);
-                println!("Server stopped (PID {})", pid);
+                println!("Server stopped (PID {pid})");
             } else {
                 // Process might already be gone
                 let _ = std::fs::remove_file(&pid_path);
-                println!("Server process {} not found (cleaned up stale PID file)", pid);
+                println!("Server process {pid} not found (cleaned up stale PID file)");
             }
         }
 
@@ -77,16 +101,16 @@ async fn main() -> Result<()> {
         Command::Status => {
             let creds_path = config::credentials_path()?;
             let creds = credentials::Credentials::load(&creds_path)?;
-            let (store, _) = vault::load_vault()?;
+            let vault_count = vault::vault_count()?;
             println!("Domain:   {}", creds.domain);
             println!("Port:     {}", creds.port);
             println!("TLS:      {}", if creds.no_tls { "disabled" } else { "enabled" });
-            println!("Vault:    {} secrets", store.len());
+            println!("Vault:    {vault_count} secrets");
         }
 
         Command::Verify { domain } => {
-            let url = format!("https://{}/.well-known/agent.json", domain);
-            println!("Fetching {}...", url);
+            let url = format!("https://{domain}/.well-known/agent.json");
+            println!("Fetching {url}...");
             let resp = reqwest::get(&url).await?;
             if !resp.status().is_success() {
                 anyhow::bail!("Failed to fetch agent.json: HTTP {}", resp.status());
@@ -106,11 +130,11 @@ async fn main() -> Result<()> {
         Command::DepositUrl { label, expires } => {
             let creds_path = config::credentials_path()?;
             let creds = credentials::Credentials::load(&creds_path)?;
+            let signing_key = creds.signing_key()?;
             let duration = deposit::parse_duration(&expires)?;
-            let dm = deposit::DepositManager::new(100);
-            let token = dm.create_deposit_url(label, duration).await?;
+            let token = deposit::create_signed_token(&label, duration, &signing_key)?;
             let url = format!("{}/d/{}", creds.base_url(), token);
-            println!("{}", url);
+            println!("{url}");
         }
 
         Command::Deposits => {
@@ -123,19 +147,33 @@ async fn main() -> Result<()> {
             if content.is_empty() {
                 println!("No deposits yet.");
             } else {
-                print!("{}", content);
+                print!("{content}");
             }
         }
 
-        Command::Vault { command } => match command {
-            VaultCommand::Set { label, value } => vault::cmd_set(&label, &value)?,
-            VaultCommand::Get { label } => vault::cmd_get(&label)?,
-            VaultCommand::List => vault::cmd_list()?,
-            VaultCommand::Delete { label } => vault::cmd_delete(&label)?,
+        Command::Vault { command } => {
+            let creds = credentials::Credentials::load(&config::credentials_path()?)?;
+            let sk = creds.signing_key()?;
+            let vault_key = crypto::vault::derive_vault_key(&sk.to_bytes())?;
+            match command {
+                VaultCommand::Set { label, value } => vault::cmd_set(&label, &value, &vault_key)?,
+                VaultCommand::Get { label } => vault::cmd_get(&label, &vault_key)?,
+                VaultCommand::List => vault::cmd_list()?,
+                VaultCommand::Delete { label } => vault::cmd_delete(&label)?,
+            }
+        }
+
+        Command::MagicLink { command } => match command {
+            MagicLinkCommand::Host { code, expires } => {
+                magic_link::host(&code, &expires)?;
+            }
+            MagicLinkCommand::List => {
+                magic_link::list()?;
+            }
         },
 
-        Command::Sign { dry_run: _, command: _ } => {
-            println!("Sign command not yet implemented (PLO-56)");
+        Command::Sign { dry_run, command } => {
+            sign::run(&command, dry_run)?;
         }
 
         Command::Key { command } => match command {

@@ -14,6 +14,8 @@ pub fn sign(signing_key: &SigningKey, message: &[u8]) -> Signature {
     signing_key.sign(message)
 }
 
+/// Verify a signature. Used by the verify command (PLO-57) and in tests.
+#[allow(dead_code)]
 pub fn verify(verifying_key: &VerifyingKey, message: &[u8], signature: &Signature) -> bool {
     verifying_key.verify(message, signature).is_ok()
 }
@@ -50,6 +52,7 @@ pub fn encode_signature(signature: &Signature) -> String {
     BASE64.encode(signature.to_bytes())
 }
 
+#[allow(dead_code)]
 pub fn decode_signature(encoded: &str) -> Result<Signature> {
     let bytes = BASE64.decode(encoded).context("Invalid base64 in signature")?;
     let sig_bytes: [u8; 64] = bytes
@@ -109,5 +112,46 @@ mod tests {
         let encoded = encode_signature(&signature);
         let decoded = decode_signature(&encoded).unwrap();
         assert_eq!(signature, decoded);
+    }
+
+    #[test]
+    fn decode_public_key_missing_prefix() {
+        assert!(decode_public_key("rsa:AAAA").is_err());
+        assert!(decode_public_key("AAAA").is_err());
+    }
+
+    #[test]
+    fn decode_public_key_invalid_base64() {
+        assert!(decode_public_key("ed25519:not-valid!!!").is_err());
+    }
+
+    #[test]
+    fn decode_public_key_wrong_length() {
+        let short = BASE64.encode([0u8; 16]); // 16 bytes, need 32
+        assert!(decode_public_key(&format!("ed25519:{short}")).is_err());
+    }
+
+    #[test]
+    fn decode_private_key_invalid_base64() {
+        assert!(decode_private_key("not-valid!!!").is_err());
+    }
+
+    #[test]
+    fn decode_private_key_wrong_length() {
+        let short = BASE64.encode([0u8; 16]);
+        assert!(decode_private_key(&short).is_err());
+    }
+
+    #[test]
+    fn decode_signature_wrong_length() {
+        let short = BASE64.encode([0u8; 32]); // 32 bytes, need 64
+        assert!(decode_signature(&short).is_err());
+    }
+
+    #[test]
+    fn sign_verify_empty_message() {
+        let (sk, vk) = generate_keypair();
+        let sig = sign(&sk, b"");
+        assert!(verify(&vk, b"", &sig));
     }
 }

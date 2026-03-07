@@ -1,91 +1,111 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use anyhow::Result;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
-use crate::crypto::token::generate_deposit_token;
+use crate::crypto::signing;
 
-#[derive(Debug)]
-pub struct PendingDeposit {
+// The payload encoded into the signed URL token.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DepositPayload {
     pub label: String,
-    pub token_hash: String,
-    pub expires_at: Instant,
+    pub nonce: String,
+    pub expires_at: i64, // unix timestamp
 }
 
-#[derive(Clone)]
-pub struct DepositManager {
-    pending: Arc<Mutex<HashMap<String, PendingDeposit>>>,
-    max_pending: usize,
+// Create a signed deposit token. The token is self-contained:
+// base64url(json_payload) + "." + base64url(ed25519_signature)
+pub fn create_signed_token(
+    label: &str,
+    expires_in: Duration,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<String> {
+    let nonce = generate_nonce();
+    let max_expiry: u64 = 24 * 3600; // 24 hours
+    let secs = expires_in.as_secs().min(max_expiry);
+    let expires_at = chrono::Utc::now().timestamp() + i64::try_from(secs)
+        .map_err(|_| anyhow::anyhow!("Duration too large"))?;
+
+    let payload = DepositPayload {
+        label: label.to_string(),
+        nonce,
+        expires_at,
+    };
+
+    let payload_json = serde_json::to_string(&payload)?;
+    let payload_b64 = B64URL.encode(payload_json.as_bytes());
+    let sig = signing::sign(signing_key, payload_b64.as_bytes());
+    let sig_b64 = B64URL.encode(sig.to_bytes());
+
+    Ok(format!("{payload_b64}.{sig_b64}"))
 }
 
-impl DepositManager {
-    pub fn new(max_pending: usize) -> Self {
-        Self {
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            max_pending,
+/// Verify signature and expiry only (no DB access). Returns the payload if valid.
+pub fn verify_signature(
+    token: &str,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Option<DepositPayload> {
+    match try_verify_signature(token, verifying_key) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::debug!("Deposit verify failed: {}", e);
+            None
         }
-    }
-
-    // Creates a deposit slot and returns the raw token for the URL.
-    // Expired entries get cleaned up on each call.
-    pub async fn create_deposit_url(
-        &self,
-        label: String,
-        expires_in: Duration,
-    ) -> anyhow::Result<String> {
-        let mut pending = self.pending.lock().await;
-
-        let now = Instant::now();
-        pending.retain(|_, d| d.expires_at > now);
-
-        if pending.len() >= self.max_pending {
-            anyhow::bail!(
-                "Too many pending deposits (max {}). Wait for some to expire.",
-                self.max_pending
-            );
-        }
-
-        let token = generate_deposit_token();
-        let token_hash = hash_token(&token);
-
-        pending.insert(
-            token_hash.clone(),
-            PendingDeposit {
-                label,
-                token_hash: token_hash.clone(),
-                expires_at: now + expires_in,
-            },
-        );
-
-        Ok(token)
-    }
-
-    // Looks up the token, removes it (one-time use), returns the label if valid.
-    pub async fn claim(&self, token: &str) -> Option<String> {
-        let token_hash = hash_token(token);
-        let mut pending = self.pending.lock().await;
-        let now = Instant::now();
-
-        if let Some(deposit) = pending.remove(&token_hash) {
-            if deposit.expires_at > now {
-                return Some(deposit.label);
-            }
-        }
-        None
-    }
-
-    pub async fn pending_count(&self) -> usize {
-        let pending = self.pending.lock().await;
-        let now = Instant::now();
-        pending.values().filter(|d| d.expires_at > now).count()
     }
 }
 
-// We store the hash, not the raw token, so a memory dump doesn't leak URLs.
-fn hash_token(token: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(token.as_bytes());
-    hex::encode(hash)
+fn try_verify_signature(
+    token: &str,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> Result<DepositPayload> {
+    let (payload_b64, sig_b64) = token
+        .split_once('.')
+        .ok_or_else(|| anyhow::anyhow!("No '.' separator in token"))?;
+
+    let sig_bytes = B64URL.decode(sig_b64)?;
+    let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
+        .map_err(|e| anyhow::anyhow!("Bad signature bytes: {e}"))?;
+
+    use ed25519_dalek::Verifier;
+    verifying_key
+        .verify(payload_b64.as_bytes(), &sig)
+        .map_err(|e| anyhow::anyhow!("Signature invalid: {e}"))?;
+
+    let payload_json = B64URL.decode(payload_b64)?;
+    let payload: DepositPayload = serde_json::from_slice(&payload_json)?;
+
+    let now = chrono::Utc::now().timestamp();
+    if payload.expires_at <= now {
+        anyhow::bail!("Token expired (expires_at={}, now={})", payload.expires_at, now);
+    }
+
+    Ok(payload)
+}
+
+/// Claim the nonce using a provided connection reference.
+pub fn claim_nonce_with_conn(
+    payload: &DepositPayload,
+    conn: &rusqlite::Connection,
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO used_deposits (nonce, label, used_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![payload.nonce, payload.label, now],
+    )?;
+
+    if inserted == 0 {
+        anyhow::bail!("Nonce already used (replay)");
+    }
+
+    Ok(())
+}
+
+fn generate_nonce() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 // Accepts "10m", "1h", "30s".
@@ -95,31 +115,30 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
         anyhow::bail!("Empty duration string");
     }
 
-    let (num_str, unit) = if s.ends_with('m') {
-        (&s[..s.len() - 1], "m")
-    } else if s.ends_with('h') {
-        (&s[..s.len() - 1], "h")
-    } else if s.ends_with('s') {
-        (&s[..s.len() - 1], "s")
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1)
     } else {
         anyhow::bail!("Duration must end with 's' (seconds), 'm' (minutes), or 'h' (hours)");
     };
 
     let num: u64 = num_str
         .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid number in duration: '{}'", num_str))?;
+        .map_err(|_| anyhow::anyhow!("Invalid number in duration: '{num_str}'"))?;
 
-    match unit {
-        "s" => Ok(Duration::from_secs(num)),
-        "m" => Ok(Duration::from_secs(num * 60)),
-        "h" => Ok(Duration::from_secs(num * 3600)),
-        _ => unreachable!(),
-    }
+    Ok(Duration::from_secs(
+        num.checked_mul(multiplier)
+            .ok_or_else(|| anyhow::anyhow!("Duration too large"))?,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::signing as s;
 
     #[test]
     fn parse_duration_values() {
@@ -135,35 +154,124 @@ mod tests {
         assert!(parse_duration("abc").is_err());
     }
 
-    #[tokio::test]
-    async fn create_then_claim() {
-        let dm = DepositManager::new(100);
-        let token = dm
-            .create_deposit_url("test_key".to_string(), Duration::from_secs(60))
-            .await
-            .unwrap();
+    #[test]
+    fn signed_token_roundtrip() {
+        let (sk, _vk) = s::generate_keypair();
+        let token = create_signed_token("test_key", Duration::from_secs(300), &sk).unwrap();
 
-        assert!(token.starts_with("dt_"));
-        assert_eq!(dm.pending_count().await, 1);
+        // Token has two parts separated by "."
+        assert!(token.contains('.'));
 
-        let label = dm.claim(&token).await.unwrap();
-        assert_eq!(label, "test_key");
-
-        // one-time: second claim fails
-        assert!(dm.claim(&token).await.is_none());
-        assert_eq!(dm.pending_count().await, 0);
+        // Decode the payload part to verify contents
+        let (payload_b64, _) = token.split_once('.').unwrap();
+        let payload_json = B64URL.decode(payload_b64).unwrap();
+        let payload: DepositPayload = serde_json::from_slice(&payload_json).unwrap();
+        assert_eq!(payload.label, "test_key");
+        assert!(!payload.nonce.is_empty());
     }
 
-    #[tokio::test]
-    async fn expired_token_rejected() {
-        let dm = DepositManager::new(100);
-        let token = dm
-            .create_deposit_url("expired_key".to_string(), Duration::from_millis(1))
-            .await
-            .unwrap();
+    #[test]
+    fn wrong_key_rejects() {
+        let (sk, _) = s::generate_keypair();
+        let (_, wrong_vk) = s::generate_keypair();
+        let token = create_signed_token("key", Duration::from_secs(300), &sk).unwrap();
+        assert!(verify_signature(&token, &wrong_vk).is_none());
+    }
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    #[test]
+    fn tampered_token_rejects() {
+        let (sk, vk) = s::generate_keypair();
+        let token = create_signed_token("key", Duration::from_secs(300), &sk).unwrap();
+        // Flip a byte in the payload using safe code
+        let mut bytes = token.into_bytes();
+        bytes[5] ^= 0x01;
+        let token = String::from_utf8(bytes).unwrap();
+        assert!(verify_signature(&token, &vk).is_none());
+    }
 
-        assert!(dm.claim(&token).await.is_none());
+    #[test]
+    fn expired_token_rejects() {
+        let (sk, vk) = s::generate_keypair();
+        // Already expired
+        let token = create_signed_token("key", Duration::from_secs(0), &sk).unwrap();
+        assert!(verify_signature(&token, &vk).is_none());
+    }
+
+    #[test]
+    fn verify_signature_valid_roundtrip() {
+        let (sk, vk) = s::generate_keypair();
+        let token = create_signed_token("mykey", Duration::from_secs(300), &sk).unwrap();
+        let payload = verify_signature(&token, &vk).unwrap();
+        assert_eq!(payload.label, "mykey");
+        assert!(!payload.nonce.is_empty());
+    }
+
+    #[test]
+    fn verify_signature_no_separator() {
+        let (_, vk) = s::generate_keypair();
+        assert!(verify_signature("no-dot-here", &vk).is_none());
+    }
+
+    #[test]
+    fn verify_signature_invalid_base64() {
+        let (_, vk) = s::generate_keypair();
+        assert!(verify_signature("not!valid.also!invalid", &vk).is_none());
+    }
+
+    #[test]
+    fn expiry_capped_at_24h() {
+        let (sk, _) = s::generate_keypair();
+        let token = create_signed_token("key", Duration::from_secs(48 * 3600), &sk).unwrap();
+        let (payload_b64, _) = token.split_once('.').unwrap();
+        let payload_json = B64URL.decode(payload_b64).unwrap();
+        let payload: DepositPayload = serde_json::from_slice(&payload_json).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // Should be capped at ~24h, not 48h
+        assert!(payload.expires_at <= now + 24 * 3600 + 5);
+        assert!(payload.expires_at > now + 23 * 3600); // but at least ~23h
+    }
+
+    #[test]
+    fn parse_duration_zero_values() {
+        assert_eq!(parse_duration("0s").unwrap(), Duration::from_secs(0));
+        assert_eq!(parse_duration("0m").unwrap(), Duration::from_secs(0));
+        assert_eq!(parse_duration("0h").unwrap(), Duration::from_secs(0));
+    }
+
+    #[test]
+    fn parse_duration_trims_whitespace() {
+        assert_eq!(parse_duration("  10m  ").unwrap(), Duration::from_secs(600));
+    }
+
+    fn test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE used_deposits (nonce TEXT PRIMARY KEY, label TEXT NOT NULL, used_at INTEGER NOT NULL);"
+        ).unwrap();
+        conn
+    }
+
+    #[test]
+    fn claim_nonce_first_use_succeeds() {
+        let conn = test_db();
+        let payload = DepositPayload {
+            label: "test".into(),
+            nonce: "unique_nonce_123".into(),
+            expires_at: chrono::Utc::now().timestamp() + 300,
+        };
+        assert!(claim_nonce_with_conn(&payload, &conn).is_ok());
+    }
+
+    #[test]
+    fn claim_nonce_replay_rejected() {
+        let conn = test_db();
+        let payload = DepositPayload {
+            label: "test".into(),
+            nonce: "replay_nonce".into(),
+            expires_at: chrono::Utc::now().timestamp() + 300,
+        };
+        claim_nonce_with_conn(&payload, &conn).unwrap();
+        let err = claim_nonce_with_conn(&payload, &conn).unwrap_err();
+        assert!(err.to_string().contains("Nonce already used"));
     }
 }

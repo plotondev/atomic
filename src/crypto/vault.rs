@@ -21,7 +21,7 @@ pub fn derive_vault_key(private_key_bytes: &[u8]) -> Result<[u8; 32]> {
 // Output: 12-byte nonce prepended to ciphertext.
 pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
@@ -29,7 +29,7 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
-        .map_err(|e| anyhow::anyhow!("Encryption failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
 
     let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
@@ -45,7 +45,7 @@ pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
 
     let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
     let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher
@@ -91,5 +91,32 @@ mod tests {
         assert_ne!(key, [0u8; 32]);
         let key2 = derive_vault_key(&private_key).unwrap();
         assert_eq!(key, key2);
+    }
+
+    #[test]
+    fn decrypt_empty_data() {
+        let key = [42u8; 32];
+        assert!(decrypt(&key, &[]).is_err());
+    }
+
+    #[test]
+    fn decrypt_too_short() {
+        let key = [42u8; 32];
+        assert!(decrypt(&key, &[0u8; 5]).is_err());
+    }
+
+    #[test]
+    fn encrypt_decrypt_empty_plaintext() {
+        let key = [42u8; 32];
+        let encrypted = encrypt(&key, b"").unwrap();
+        let decrypted = decrypt(&key, &encrypted).unwrap();
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn derive_vault_key_differs_for_different_inputs() {
+        let k1 = derive_vault_key(&[1u8; 32]).unwrap();
+        let k2 = derive_vault_key(&[2u8; 32]).unwrap();
+        assert_ne!(k1, k2);
     }
 }

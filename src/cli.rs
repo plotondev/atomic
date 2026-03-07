@@ -31,10 +31,6 @@ pub enum Command {
         #[arg(long)]
         tls_key: Option<String>,
 
-        /// Proxy non-identity traffic to this address
-        #[arg(long)]
-        proxy_to: Option<String>,
-
         /// Overwrite existing identity
         #[arg(long)]
         force: bool,
@@ -76,6 +72,12 @@ pub enum Command {
     Vault {
         #[command(subcommand)]
         command: VaultCommand,
+    },
+
+    /// Host a verification code for domain proof
+    MagicLink {
+        #[command(subcommand)]
+        command: MagicLinkCommand,
     },
 
     /// Sign an outgoing HTTP request
@@ -123,6 +125,20 @@ pub enum VaultCommand {
         /// Label of the secret to delete
         label: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum MagicLinkCommand {
+    /// Host a code for a service to verify
+    Host {
+        /// The verification code to host
+        code: String,
+        /// How long to host it (e.g., 5m, 10m)
+        #[arg(long, default_value = "5m")]
+        expires: String,
+    },
+    /// List active magic links
+    List,
 }
 
 #[derive(Subcommand)]
