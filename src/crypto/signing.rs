@@ -39,7 +39,7 @@ pub fn decode_public_key(encoded: &str) -> Result<VerifyingKey> {
 
 pub fn encode_private_key(signing_key: &SigningKey) -> String {
     let key_bytes = Zeroizing::new(signing_key.to_bytes());
-    BASE64.encode(&*key_bytes)
+    BASE64.encode(*key_bytes)
 }
 
 pub fn decode_private_key(encoded: &str) -> Result<SigningKey> {

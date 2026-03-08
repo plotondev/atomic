@@ -70,7 +70,6 @@ struct DepositResponse {
 #[derive(Serialize)]
 struct MagicLinkResponse {
     status: &'static str,
-    code: String,
 }
 
 /// Max deposit body size: 1 MB
@@ -299,6 +298,11 @@ async fn handle_magic_link(
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
+    // Reject obviously short codes before touching the DB (host() enforces >= 20 chars)
+    if code.len() < 20 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     let state_clone = state.clone();
     let code_clone = code;
     let result = tokio::task::spawn_blocking(move || {
@@ -308,8 +312,8 @@ async fn handle_magic_link(
     }).await;
 
     match result {
-        Ok(Ok(Some(verified_code))) => {
-            let resp = MagicLinkResponse { status: "verified", code: verified_code };
+        Ok(Ok(Some(_))) => {
+            let resp = MagicLinkResponse { status: "verified" };
             match serde_json::to_string(&resp) {
                 Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
                 Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

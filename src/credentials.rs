@@ -41,6 +41,7 @@ impl std::fmt::Debug for Credentials {
 }
 
 impl Credentials {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         domain: String,
         signing_key: &SigningKey,

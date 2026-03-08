@@ -23,7 +23,7 @@ pub fn open() -> Result<Connection> {
 
     // WAL mode: fast reads, lets multiple processes access the file
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "cache_size", "-2000")?;
 
     // CREATE TABLE IF NOT EXISTS is idempotent — safe to run every time
