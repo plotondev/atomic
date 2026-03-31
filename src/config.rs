@@ -68,6 +68,31 @@ pub fn log_path() -> Result<PathBuf> {
     Ok(atomic_dir()?.join("atomic.log"))
 }
 
+/// Acquire an exclusive flock on the PID file to prevent double-start races.
+/// Returns the open File handle — caller must keep it alive for the duration of the process.
+/// The lock is automatically released by the kernel when the process exits (even on crash).
+pub fn acquire_pid_lock(path: &Path) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    use std::io::Write;
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("Failed to open PID file at {}", path.display()))?;
+
+    file.try_lock_exclusive()
+        .context("Another atomic process is already running (PID file locked)")?;
+
+    // Write PID after lock acquired
+    let mut f = &file;
+    file.set_len(0)?;
+    f.write_all(std::process::id().to_string().as_bytes())?;
+    file.sync_all()?;
+    Ok(file)
+}
+
 pub fn ensure_atomic_dir() -> Result<PathBuf> {
     let dir = atomic_dir()?;
     if !dir.exists() {

@@ -12,6 +12,10 @@ mod sign;
 mod tls;
 mod vault;
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -23,6 +27,15 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("atomic=info".parse()?))
         .init();
+
+    // Clean up PID file on panic (best-effort). With panic=abort in release,
+    // the hook still runs before the process terminates.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("atomic: fatal panic: {info}");
+        if let Ok(path) = config::pid_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }));
 
     let cli = Cli::parse();
 

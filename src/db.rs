@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::config;
 
@@ -15,9 +16,11 @@ pub struct DbPool {
 }
 
 /// RAII guard that returns the connection to the pool on drop.
+/// Tracks hold time to detect potential connection leaks.
 pub struct PooledConn<'a> {
     pool: &'a DbPool,
     conn: Option<Connection>,
+    acquired_at: Instant,
 }
 
 impl<'a> std::ops::Deref for PooledConn<'a> {
@@ -30,6 +33,10 @@ impl<'a> std::ops::Deref for PooledConn<'a> {
 impl Drop for PooledConn<'_> {
     fn drop(&mut self) {
         if let Some(c) = self.conn.take() {
+            let held = self.acquired_at.elapsed();
+            if held > Duration::from_secs(30) {
+                tracing::warn!("SQLite connection held for {:?}, possible leak", held);
+            }
             let _ = self.pool.sender.send(c);
         }
     }
@@ -45,6 +52,7 @@ impl DbPool {
         Ok(PooledConn {
             pool: self,
             conn: Some(conn),
+            acquired_at: Instant::now(),
         })
     }
 }

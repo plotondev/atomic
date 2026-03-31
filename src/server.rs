@@ -7,8 +7,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use dashmap::DashMap;
 use serde::Serialize;
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -91,7 +91,8 @@ pub struct AppState {
     pub db_pool: crate::db::DbPool,
     pub tls_active: bool,
     pub behind_proxy: bool,
-    rate_limiter: std::sync::Mutex<HashMap<IpAddr, (u32, i64)>>,
+    /// Sharded concurrent map — no global mutex contention under high concurrency.
+    rate_limiter: DashMap<IpAddr, (u32, i64)>,
 }
 
 impl AppState {
@@ -100,16 +101,14 @@ impl AppState {
     }
 
     /// Returns true if the request is within rate limits.
+    /// Uses DashMap (sharded locks) so concurrent requests don't serialize on a global mutex.
     pub fn check_rate_limit(&self, ip: IpAddr) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let mut map = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
-        // Always evict stale entries to guarantee bounded memory regardless of attacker volume
-        map.retain(|_, (_, window_start)| now - *window_start <= RATE_LIMIT_WINDOW_SECS);
-        // Hard cap as defense-in-depth against clock skew or other edge cases
-        if map.len() >= RATE_LIMIT_MAX_ENTRIES {
+        // Hard cap as defense-in-depth (approximate len is fine for rate limiting)
+        if self.rate_limiter.len() >= RATE_LIMIT_MAX_ENTRIES {
             return false;
         }
-        let entry = map.entry(ip).or_insert((0, now));
+        let mut entry = self.rate_limiter.entry(ip).or_insert((0, now));
         if now - entry.1 > RATE_LIMIT_WINDOW_SECS {
             *entry = (1, now);
             true
@@ -205,7 +204,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         db_pool,
         tls_active,
         behind_proxy,
-        rate_limiter: std::sync::Mutex::new(HashMap::with_capacity(256)),
+        rate_limiter: DashMap::with_capacity(256),
     });
 
     // Background task: WAL checkpoint every 5 minutes (PASSIVE to avoid blocking writers;
@@ -264,12 +263,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                     if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
                         tracing::warn!("Hourly WAL TRUNCATE checkpoint failed: {e}");
                     }
-                    // Drop connection back to pool before locking rate limiter
+                    // Let SQLite update its query planner statistics
+                    let _ = conn.execute_batch("PRAGMA optimize;");
+                    // Drop connection back to pool before touching rate limiter
                     drop(conn);
-                    // Evict stale rate limiter entries
-                    let mut map = db_ref.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
+                    // Evict stale rate limiter entries (DashMap::retain is lock-free per shard)
                     let now = chrono::Utc::now().timestamp();
-                    map.retain(|_, (_, window_start)| now - *window_start <= RATE_LIMIT_WINDOW_SECS);
+                    db_ref.rate_limiter.retain(|_, (_, window_start)| now - *window_start <= RATE_LIMIT_WINDOW_SECS);
                 }).await;
             }
         }
@@ -303,7 +303,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .with_state(state);
 
     let pid_path = config::pid_path()?;
-    config::write_secure(&pid_path, std::process::id().to_string().as_bytes())?;
+    // Acquire flock — prevents double-start races. Lock released on process exit (even crash).
+    let _pid_lock = config::acquire_pid_lock(&pid_path)?;
 
     match tls_mode {
         TlsMode::None => {
