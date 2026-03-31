@@ -5,3 +5,6 @@
 .env
 .claude/
 CLAUDE.md
+.lambda-rlm-cache/
+src/.*.md
+src/.*.log
