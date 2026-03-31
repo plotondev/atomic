@@ -242,6 +242,14 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - WAL checkpointing split: PASSIVE every 5m (non-blocking), TRUNCATE hourly (reclaims disk)
 - `atomic stop`: kill -0 probe before SIGTERM to minimize PID reuse race window
 
+**1b65780** — Connection pool, handler timeouts, credential zeroize, startup guards
+- Replace `Mutex<Connection>` with zero-dep channel-based `DbPool` (4 conns), unlocking WAL concurrent readers
+- Wrap handler DB ops in `tokio::time::timeout(5s)` to prevent unbounded task accumulation
+- Lower SQLite `busy_timeout` to 4s (below tokio 5s) for clean BUSY errors before task cancellation
+- Zeroize credential JSON buffer in `save()` via `Zeroizing<Vec<u8>>` — private key material no longer lingers in freed heap
+- Startup guard: warn if `RLIMIT_NOFILE < 4096` (prevents cryptic fd exhaustion under TLS load)
+- Startup guard: warn if log file exceeds 100MB (prevents disk-full failures on vault atomic writes)
+
 ## Roadmap
 
 - [x] Identity (agent.json + Ed25519)
