@@ -56,10 +56,6 @@ pub fn deposits_log_path() -> Result<PathBuf> {
     Ok(atomic_dir()?.join("deposits.log"))
 }
 
-pub fn tls_dir() -> Result<PathBuf> {
-    Ok(atomic_dir()?.join("tls"))
-}
-
 pub fn pid_path() -> Result<PathBuf> {
     Ok(atomic_dir()?.join("atomic.pid"))
 }

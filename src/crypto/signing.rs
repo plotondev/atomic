@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
 use base64ct::{Base64, Encoding};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;
+
+use super::CryptoError;
 
 pub fn generate_keypair() -> (SigningKey, VerifyingKey) {
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -25,15 +26,15 @@ pub fn encode_public_key(verifying_key: &VerifyingKey) -> String {
     format!("ed25519:{}", Base64::encode_string(verifying_key.as_bytes()))
 }
 
-pub fn decode_public_key(encoded: &str) -> Result<VerifyingKey> {
+pub fn decode_public_key(encoded: &str) -> Result<VerifyingKey, CryptoError> {
     let b64 = encoded
         .strip_prefix("ed25519:")
-        .context("Public key must start with 'ed25519:'")?;
-    let bytes = Base64::decode_vec(b64).map_err(|_| anyhow::anyhow!("Invalid base64 in public key"))?;
+        .ok_or(CryptoError::InvalidKey)?;
+    let bytes = Base64::decode_vec(b64).map_err(|_| CryptoError::InvalidKey)?;
     let key_bytes: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| anyhow::anyhow!("Public key must be 32 bytes"))?;
-    VerifyingKey::from_bytes(&key_bytes).context("Invalid Ed25519 public key")
+        .map_err(|_| CryptoError::InvalidKey)?;
+    VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidKey)
 }
 
 pub fn encode_private_key(signing_key: &SigningKey) -> String {
@@ -41,10 +42,10 @@ pub fn encode_private_key(signing_key: &SigningKey) -> String {
     Base64::encode_string(&*key_bytes)
 }
 
-pub fn decode_private_key(encoded: &str) -> Result<SigningKey> {
-    let bytes = Zeroizing::new(Base64::decode_vec(encoded).map_err(|_| anyhow::anyhow!("Invalid base64 in private key"))?);
+pub fn decode_private_key(encoded: &str) -> Result<SigningKey, CryptoError> {
+    let bytes = Zeroizing::new(Base64::decode_vec(encoded).map_err(|_| CryptoError::InvalidKey)?);
     if bytes.len() != 32 {
-        anyhow::bail!("Private key must be 32 bytes");
+        return Err(CryptoError::InvalidKey);
     }
     let mut key_bytes = Zeroizing::new([0u8; 32]);
     key_bytes.copy_from_slice(&bytes);
@@ -56,11 +57,11 @@ pub fn encode_signature(signature: &Signature) -> String {
 }
 
 #[allow(dead_code)]
-pub fn decode_signature(encoded: &str) -> Result<Signature> {
-    let bytes = Base64::decode_vec(encoded).map_err(|_| anyhow::anyhow!("Invalid base64 in signature"))?;
+pub fn decode_signature(encoded: &str) -> Result<Signature, CryptoError> {
+    let bytes = Base64::decode_vec(encoded).map_err(|_| CryptoError::InvalidSignature)?;
     let sig_bytes: [u8; 64] = bytes
         .try_into()
-        .map_err(|_| anyhow::anyhow!("Signature must be 64 bytes"))?;
+        .map_err(|_| CryptoError::InvalidSignature)?;
     Ok(Signature::from_bytes(&sig_bytes))
 }
 

@@ -2,29 +2,30 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use anyhow::{Context, Result};
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
 use zeroize::Zeroizing;
+
+use super::CryptoError;
 
 const NONCE_SIZE: usize = 12;
 const HKDF_SALT: &[u8] = b"atomic-v1";
 const MAX_CIPHERTEXT_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 // HKDF with salt and "atomic-vault" context, so the vault key differs from the signing key.
-pub fn derive_vault_key(private_key_bytes: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
+pub fn derive_vault_key(private_key_bytes: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), private_key_bytes);
     let mut key = Zeroizing::new([0u8; 32]);
     hk.expand(b"atomic-vault", key.as_mut())
-        .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
+        .map_err(|_| CryptoError::KeyDerivationFailed)?;
     Ok(key)
 }
 
 // Output: 12-byte nonce prepended to ciphertext.
-pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
+        .map_err(|_| CryptoError::EncryptionFailed)?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
@@ -32,7 +33,7 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
-        .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
+        .map_err(|_| CryptoError::EncryptionFailed)?;
 
     let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
@@ -42,23 +43,19 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 
 // Expects 12-byte nonce prepended to ciphertext (same format encrypt() produces).
 // Returns Zeroizing<Vec<u8>> so plaintext is wiped from memory on drop.
-pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-    if data.len() < NONCE_SIZE {
-        anyhow::bail!("Encrypted data too short");
-    }
-    if data.len() > MAX_CIPHERTEXT_SIZE {
-        anyhow::bail!("Encrypted data too large");
+pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    if data.len() < NONCE_SIZE || data.len() > MAX_CIPHERTEXT_SIZE {
+        return Err(CryptoError::InvalidCiphertext);
     }
 
     let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
     let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
+        .map_err(|_| CryptoError::InvalidCiphertext)?;
     let nonce = Nonce::from_slice(nonce_bytes);
 
     let plaintext = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow::anyhow!("Decryption failed (wrong key or corrupted data)"))
-        .context("Vault decryption failed")?;
+        .map_err(|_| CryptoError::InvalidCiphertext)?;
 
     Ok(Zeroizing::new(plaintext))
 }
@@ -118,8 +115,7 @@ mod tests {
     fn decrypt_oversized_rejected() {
         let key = [42u8; 32];
         let oversized = vec![0u8; MAX_CIPHERTEXT_SIZE + 1];
-        let err = decrypt(&key, &oversized).unwrap_err();
-        assert!(err.to_string().contains("too large"));
+        assert!(matches!(decrypt(&key, &oversized), Err(CryptoError::InvalidCiphertext)));
     }
 
     #[test]

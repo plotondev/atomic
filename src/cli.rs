@@ -82,12 +82,6 @@ pub enum Command {
         command: VaultCommand,
     },
 
-    /// Host a verification code for domain proof
-    MagicLink {
-        #[command(subcommand)]
-        command: MagicLinkCommand,
-    },
-
     /// Sign an outgoing HTTP request
     Sign {
         /// Print modified command without executing
@@ -133,20 +127,6 @@ pub enum VaultCommand {
         /// Label of the secret to delete
         label: String,
     },
-}
-
-#[derive(Subcommand)]
-pub enum MagicLinkCommand {
-    /// Host a code for a service to verify
-    Host {
-        /// The verification code to host
-        code: String,
-        /// How long to host it in seconds (max 3600)
-        #[arg(long, default_value = "300")]
-        expires: u64,
-    },
-    /// List active magic links
-    List,
 }
 
 #[derive(Subcommand)]

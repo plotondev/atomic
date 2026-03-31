@@ -66,7 +66,6 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 fs2 = "0.4"
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
-subtle = "2"
 
 [profile.release]
 opt-level = 3

@@ -65,11 +65,11 @@ impl Credentials {
     }
 
     pub fn signing_key(&self) -> Result<SigningKey> {
-        signing::decode_private_key(&self.private_key)
+        Ok(signing::decode_private_key(&self.private_key)?)
     }
 
     pub fn verifying_key(&self) -> Result<VerifyingKey> {
-        signing::decode_public_key(&self.public_key)
+        Ok(signing::decode_public_key(&self.public_key)?)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

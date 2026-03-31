@@ -6,7 +6,6 @@ mod crypto;
 mod db;
 mod deposit;
 mod init;
-mod magic_link;
 mod server;
 mod sign;
 mod tls;
@@ -20,7 +19,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use cli::{Cli, Command, KeyCommand, MagicLinkCommand, ServiceCommand, VaultCommand};
+use cli::{Cli, Command, KeyCommand, ServiceCommand, VaultCommand};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -193,15 +192,6 @@ async fn main() -> Result<()> {
                 VaultCommand::Delete { label } => vault::cmd_delete(&label)?,
             }
         }
-
-        Command::MagicLink { command } => match command {
-            MagicLinkCommand::Host { code, expires } => {
-                magic_link::host(&code, expires)?;
-            }
-            MagicLinkCommand::List => {
-                magic_link::list()?;
-            }
-        },
 
         Command::Sign { dry_run, command } => {
             sign::run(&command, dry_run)?;

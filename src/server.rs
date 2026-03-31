@@ -8,7 +8,6 @@ use axum::{
     Router,
 };
 use serde::Serialize;
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use tower_http::cors::{Any, CorsLayer};
@@ -29,15 +28,10 @@ static APP_STATE: OnceLock<AppState> = OnceLock::new();
 /// so that SQLite returns BUSY cleanly before the task gets force-cancelled.
 const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-const RATE_LIMIT_WINDOW_SECS: u64 = 60;
-const RATE_LIMIT_MAX_REQUESTS: u32 = 10;
-const RATE_LIMIT_MAX_ENTRIES: usize = 10_000;
 const MAX_INPUT_LEN: usize = 256;
 
 /// Circuit breaker cool-down: DB operations rejected for this many seconds after last failure.
 const DB_CIRCUIT_COOLDOWN_SECS: u64 = 60;
-
-const RATE_SHARDS: usize = 8;
 
 fn epoch_secs() -> u64 {
     config::epoch_secs()
@@ -62,76 +56,6 @@ fn is_valid_input(s: &str) -> bool {
         && s.bytes().all(|b| ASCII_OK[b as usize])
 }
 
-/// Sharded mutex rate limiter — replaces DashMap for minimal overhead at <10k entries.
-/// 8 shards eliminate contention without the DashMap dependency tree.
-struct RateLimiter {
-    shards: [std::sync::Mutex<HashMap<IpAddr, (u32, std::time::Instant)>>; RATE_SHARDS],
-}
-
-impl RateLimiter {
-    fn new() -> Self {
-        Self {
-            shards: std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn shard_index(ip: &IpAddr) -> usize {
-        let h = match ip {
-            IpAddr::V4(v4) => {
-                let o = v4.octets();
-                (o[0] as usize).wrapping_mul(31) ^ (o[1] as usize).wrapping_mul(17)
-                    ^ (o[2] as usize).wrapping_mul(7) ^ (o[3] as usize)
-            }
-            IpAddr::V6(v6) => {
-                v6.octets().iter().fold(0usize, |acc, &b| acc.wrapping_mul(31) ^ b as usize)
-            }
-        };
-        h & (RATE_SHARDS - 1)
-    }
-
-    fn check(&self, ip: IpAddr) -> bool {
-        let now = std::time::Instant::now();
-        let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
-        // Fail open: if shard lock is contested, allow the request rather than block.
-        // A locked shard indicates system stress; blocking increases backlog.
-        let mut shard = match self.shards[Self::shard_index(&ip)].try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return true,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        };
-        // Hard cap per shard to prevent unbounded growth
-        if shard.len() >= RATE_LIMIT_MAX_ENTRIES / RATE_SHARDS {
-            let stale = shard.iter()
-                .find(|(_, (_, ts))| now.duration_since(*ts) > window)
-                .map(|(k, _)| *k);
-            match stale {
-                Some(key) => { shard.remove(&key); }
-                None => return false,
-            }
-        }
-        let entry = shard.entry(ip).or_insert((0, now));
-        if now.duration_since(entry.1) > window {
-            *entry = (1, now);
-            true
-        } else if entry.0 >= RATE_LIMIT_MAX_REQUESTS {
-            false
-        } else {
-            entry.0 += 1;
-            true
-        }
-    }
-
-    /// Evict stale entries from all shards. Called by hourly cleanup.
-    fn clean_stale(&self) {
-        let now = std::time::Instant::now();
-        let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
-        for shard in &self.shards {
-            let mut map = shard.lock().unwrap_or_else(|e| e.into_inner());
-            map.retain(|_, (_, ts)| now.duration_since(*ts) <= window);
-        }
-    }
-}
-
 pub struct AppState {
     pub agent_json_cached: bytes::Bytes,
     pub verifying_key: ed25519_dalek::VerifyingKey,
@@ -141,8 +65,6 @@ pub struct AppState {
     pub db_pool: crate::db::DbPool,
     pub tls_active: bool,
     pub behind_proxy: bool,
-    /// Sharded mutex rate limiter — monotonic Instant prevents clock-skew attacks.
-    rate_limiter: RateLimiter,
     /// In-flight request counter for graceful shutdown drain.
     in_flight: std::sync::atomic::AtomicUsize,
     /// Circuit breaker: epoch second of last DB failure. Circuit open if within cooldown.
@@ -152,11 +74,6 @@ pub struct AppState {
 impl AppState {
     pub fn vault_key(&self) -> &[u8; 32] {
         &self.vault_key
-    }
-
-    /// Returns true if the request is within rate limits.
-    pub fn check_rate_limit(&self, ip: IpAddr) -> bool {
-        self.rate_limiter.check(ip)
     }
 
     /// Record a DB failure timestamp. The first request after the cooldown naturally tests the DB.
@@ -214,9 +131,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
 
     let verifying_key = credentials.verifying_key()?;
     let signing_key = credentials.signing_key()?;
-    let mut sk_bytes = Zeroizing::new(signing_key.to_bytes());
+    let sk_bytes = Zeroizing::new(signing_key.to_bytes());
     let vault_key = crate::crypto::vault::derive_vault_key(&sk_bytes)?;
-    sk_bytes.iter_mut().for_each(|b| *b = 0); // belt-and-suspenders
     drop(sk_bytes);
 
     // Pool size: env override or auto-detect from available parallelism (capped 2..8)
@@ -245,44 +161,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         db_pool,
         tls_active,
         behind_proxy,
-        rate_limiter: RateLimiter::new(),
         in_flight: std::sync::atomic::AtomicUsize::new(0),
         last_db_failure: std::sync::atomic::AtomicU64::new(0),
     }).map_err(|_| anyhow::anyhow!("server already initialized"))?;
     let state: &'static AppState = APP_STATE.get().unwrap();
 
-    // Background task: WAL checkpoint every 5 minutes (PASSIVE to avoid blocking writers;
-    // the hourly cleanup task runs TRUNCATE to actually reclaim WAL disk space).
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-            let _ = tokio::task::spawn_blocking(move || {
-                let wal_large = crate::config::atomic_dir()
-                    .map(|d| d.join("atomic.db-wal"))
-                    .ok()
-                    .and_then(|p| std::fs::metadata(&p).ok())
-                    .map(|m| m.len() > 40 * 1024 * 1024)
-                    .unwrap_or(false);
-
-                match state.db_pool.get() {
-                    Ok(conn) => {
-                        if wal_large {
-                            tracing::warn!("WAL exceeds 40MB, forcing TRUNCATE checkpoint");
-                            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                                tracing::warn!("WAL TRUNCATE checkpoint failed: {e}, falling back to RESTART");
-                                let _ = conn.execute_batch("PRAGMA wal_checkpoint(RESTART);");
-                            }
-                        } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
-                            tracing::warn!("WAL checkpoint failed: {e}");
-                        }
-                    }
-                    Err(e) => tracing::warn!("WAL checkpoint: pool exhausted: {e}"),
-                }
-            }).await;
-        }
-    });
-
-    // Background task: clean expired magic links, old deposit nonces, stale rate limiter entries hourly
+    // Background task: hourly cleanup of expired deposit data + PRAGMA optimize.
+    // WAL checkpointing is handled by wal_autocheckpoint=1000 (set in open_connection).
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -295,19 +180,6 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                     }
                 };
                 let now = epoch_secs() as i64;
-                // Paginated deletes: batch 1000 rows at a time to avoid holding
-                // the WAL write lock for extended periods under heavy load.
-                loop {
-                    match conn.execute(
-                        "DELETE FROM magic_links WHERE rowid IN \
-                         (SELECT rowid FROM magic_links WHERE expires_at <= ?1 LIMIT 1000)",
-                        [now],
-                    ) {
-                        Ok(0) => break,
-                        Ok(_) => continue,
-                        Err(e) => { tracing::warn!("Failed to clean expired magic links: {e}"); break; }
-                    }
-                }
                 let cutoff = now - 7 * 86400;
                 loop {
                     match conn.execute(
@@ -332,18 +204,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                         Err(e) => { tracing::warn!("Failed to clean old deposit log entries: {e}"); break; }
                     }
                 }
-                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                    tracing::warn!("Hourly WAL TRUNCATE checkpoint failed: {e}");
-                }
                 let _ = conn.execute_batch("PRAGMA optimize;");
             }).await;
-            // Clean stale rate limiter entries (non-blocking, quick lock per shard)
-            state.rate_limiter.clean_stale();
         }
     });
 
-    // CORS only on the public agent.json endpoint; deposit and magic link
-    // endpoints are called by servers, not browsers, and don't need CORS.
+    // CORS only on the public agent.json endpoint; deposit endpoints
+    // are called by servers, not browsers, and don't need CORS.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -359,7 +226,6 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .route("/", get(root_redirect))
         .merge(public_routes)
         .route("/d/{token}", post(handle_deposit))
-        .route("/m/{code}", get(handle_magic_link))
         .route("/_/health", get(handle_health))
         .fallback(handle_404)
         .layer(middleware::from_fn_with_state(
@@ -394,32 +260,6 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         }
         TlsMode::Custom { .. } => {
             let rustls_config = crate::tls::resolve_rustls_config(&tls_mode).await?;
-            // Reload TLS cert on SIGHUP
-            #[cfg(unix)]
-            {
-                let sighup_config = rustls_config.clone();
-                tokio::spawn(async move {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut sighup = signal(SignalKind::hangup())
-                        .expect("Failed to install SIGHUP handler");
-                    loop {
-                        sighup.recv().await;
-                        let tls_dir = match crate::config::tls_dir() {
-                            Ok(d) => d,
-                            Err(e) => {
-                                tracing::warn!("SIGHUP cert reload failed: {e}");
-                                continue;
-                            }
-                        };
-                        let cert_path = tls_dir.join("fullchain.pem");
-                        let key_path = tls_dir.join("key.pem");
-                        match sighup_config.reload_from_pem_file(&cert_path, &key_path).await {
-                            Ok(()) => info!("TLS cert reloaded (SIGHUP)"),
-                            Err(e) => tracing::warn!("TLS cert reload failed (SIGHUP): {e}"),
-                        }
-                    }
-                });
-            }
             let handle = axum_server::Handle::new();
             let shutdown_handle = handle.clone();
             tokio::spawn(async move {
@@ -520,8 +360,9 @@ async fn handle_deposit(
     }
 
     // Circuit breaker: reject immediately if DB is known-broken (disk full, corrupt, etc.)
+    // Returns uniform 404 to prevent information leakage about internal state.
     if state.is_db_circuit_open() {
-        return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "30")]).into_response();
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // Only trust X-Forwarded-For when running behind a known reverse proxy.
@@ -598,64 +439,6 @@ async fn handle_deposit(
         }
         Ok(Err(e)) => {
             tracing::error!("Deposit task panicked: {e}");
-            state.record_db_failure();
-            StatusCode::NOT_FOUND.into_response()
-        }
-    }
-}
-
-async fn handle_magic_link(
-    State(state): State<&'static AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(code): Path<String>,
-) -> Response {
-    // Per-IP rate limiting to prevent brute-force of magic link codes.
-    // For a single-tenant agent, per-IP is sufficient — distributed brute-force
-    // across thousands of IPs is not the threat model.
-    if !state.check_rate_limit(addr.ip()) {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
-
-    // Reject obviously short codes or codes with non-printable chars before touching the DB
-    if code.len() < 20 || !is_valid_input(&code) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
-    // Circuit breaker: reject immediately if DB is known-broken
-    if state.is_db_circuit_open() {
-        return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "30")]).into_response();
-    }
-
-    let code_clone = code;
-    let result = tokio::time::timeout(
-        DB_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            let conn = state.db_pool.get()?;
-            Ok::<_, anyhow::Error>(crate::magic_link::claim_with_conn(&code_clone, &conn))
-        })
-    ).await;
-
-    match result {
-        Err(_elapsed) => {
-            tracing::error!("Magic link handler timed out");
-            state.record_db_failure();
-            StatusCode::NOT_FOUND.into_response()
-        }
-        Ok(Ok(Ok(Some(_)))) => {
-            state.record_db_success();
-            (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], r#"{"status":"verified"}"#).into_response()
-        }
-        Ok(Ok(Ok(None))) => {
-            state.record_db_success();
-            StatusCode::NOT_FOUND.into_response()
-        }
-        Ok(Ok(Err(e))) => {
-            tracing::error!("Magic link DB error: {e}");
-            state.record_db_failure();
-            StatusCode::NOT_FOUND.into_response()
-        }
-        Ok(Err(e)) => {
-            tracing::error!("Magic link task panicked: {e}");
             state.record_db_failure();
             StatusCode::NOT_FOUND.into_response()
         }

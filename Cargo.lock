@@ -134,7 +134,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "subtle",
  "thiserror",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",

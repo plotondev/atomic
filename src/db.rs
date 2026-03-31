@@ -1,24 +1,20 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use std::path::{Path, PathBuf};
+use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config;
 
-/// Maximum lifetime for a pooled connection before it's recycled.
-/// Prevents SQLite page cache fragmentation from accumulating over hours/days.
-const CONN_MAX_LIFETIME: Duration = Duration::from_secs(1800); // 30 minutes
-
 /// Zero-dependency connection pool for SQLite.
-/// Uses Mutex<Vec> + Condvar — minimal overhead for small pool sizes (2-8).
+/// Uses Mutex<VecDeque> + Condvar — O(1) push/pop for small pool sizes (2-8).
 /// WAL mode allows concurrent readers; the pool prevents serialization
 /// behind a single Mutex<Connection>.
 pub struct DbPool {
-    conns: Mutex<Vec<(Connection, Instant)>>,
+    conns: Mutex<VecDeque<Connection>>,
     available: Condvar,
-    db_path: PathBuf,
     shutdown: AtomicBool,
 }
 
@@ -27,7 +23,6 @@ pub struct DbPool {
 pub struct PooledConn<'a> {
     pool: &'a DbPool,
     conn: Option<Connection>,
-    created_at: Instant,
     acquired_at: Instant,
 }
 
@@ -64,7 +59,7 @@ impl Drop for PooledConn<'_> {
             // double-panic abort (which would skip remaining destructors and Zeroizing).
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut conns = self.pool.conns.lock().unwrap_or_else(|e| e.into_inner());
-                conns.push((c, self.created_at));
+                conns.push_back(c);
                 self.pool.available.notify_one();
             }));
             if result.is_err() {
@@ -83,8 +78,6 @@ impl DbPool {
     }
 
     /// Get a connection from the pool, blocking up to 5 seconds.
-    /// Connections older than 30 minutes are recycled to reset SQLite's
-    /// internal allocator and prevent page cache fragmentation.
     pub fn get(&self) -> Result<PooledConn<'_>> {
         if self.shutdown.load(Ordering::SeqCst) {
             anyhow::bail!("DB pool shutting down");
@@ -92,22 +85,10 @@ impl DbPool {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some((conn, created_at)) = conns.pop() {
-                if created_at.elapsed() > CONN_MAX_LIFETIME {
-                    drop(conn);
-                    drop(conns); // release lock during open_connection
-                    let fresh = open_connection(&self.db_path)?;
-                    return Ok(PooledConn {
-                        pool: self,
-                        conn: Some(fresh),
-                        created_at: Instant::now(),
-                        acquired_at: Instant::now(),
-                    });
-                }
+            if let Some(conn) = conns.pop_front() {
                 return Ok(PooledConn {
                     pool: self,
                     conn: Some(conn),
-                    created_at,
                     acquired_at: Instant::now(),
                 });
             }
@@ -175,18 +156,16 @@ pub fn open_pool(size: usize) -> Result<DbPool> {
     let first = open_connection(&db_path)?;
     migrate(&first)?;
 
-    let now = Instant::now();
-    let mut conns = Vec::with_capacity(size);
-    conns.push((first, now));
+    let mut conns = VecDeque::with_capacity(size);
+    conns.push_back(first);
 
     for _ in 1..size {
-        conns.push((open_connection(&db_path)?, now));
+        conns.push_back(open_connection(&db_path)?);
     }
 
     Ok(DbPool {
         conns: Mutex::new(conns),
         available: Condvar::new(),
-        db_path,
         shutdown: AtomicBool::new(false),
     })
 }
@@ -201,22 +180,11 @@ pub fn open() -> Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    // Migrate magic_links from old schemas (plaintext `code` or `hint` column).
-    // Magic links are short-lived, so dropping the table is safe.
-    let needs_recreate = conn.prepare("SELECT code FROM magic_links LIMIT 0").is_ok()
-        || conn.prepare("SELECT hint FROM magic_links LIMIT 0").is_ok();
-    if needs_recreate {
-        conn.execute_batch("DROP TABLE magic_links;")
-            .context("Failed to migrate magic_links table")?;
-    }
+    // Drop legacy magic_links table if it exists (feature removed).
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS magic_links;");
 
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS magic_links (
-            code_hash  TEXT PRIMARY KEY,
-            expires_at INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS used_deposits (
+        "CREATE TABLE IF NOT EXISTS used_deposits (
             nonce      TEXT PRIMARY KEY,
             label      TEXT NOT NULL,
             used_at    INTEGER NOT NULL
@@ -235,10 +203,6 @@ fn migrate(conn: &Connection) -> Result<()> {
             deposited_at INTEGER NOT NULL
         );
 
-        -- Indexes on time columns used by the hourly cleanup task.
-        -- Without these, DELETE ... WHERE expires_at/used_at/deposited_at < ?
-        -- does a full table scan, holding a write lock longer than necessary.
-        CREATE INDEX IF NOT EXISTS idx_magic_links_expires ON magic_links(expires_at);
         CREATE INDEX IF NOT EXISTS idx_used_deposits_used_at ON used_deposits(used_at);
         CREATE INDEX IF NOT EXISTS idx_deposit_log_deposited_at ON deposit_log(deposited_at);",
     )

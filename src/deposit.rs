@@ -72,9 +72,12 @@ fn try_verify_signature(
         .verify(payload_b64.as_bytes(), &sig)
         .map_err(|e| anyhow::anyhow!("Signature invalid: {e}"))?;
 
-    let payload_json = Base64UrlUnpadded::decode_vec(payload_b64)
+    // Stack-allocated buffer for payload decoding (zero heap allocation).
+    // DepositPayload JSON is well under 512 bytes (label≤256 + nonce=32 + overhead).
+    let mut payload_buf = [0u8; 768];
+    let payload_bytes = Base64UrlUnpadded::decode(payload_b64, &mut payload_buf)
         .map_err(|_| anyhow::anyhow!("Bad payload encoding"))?;
-    let payload: DepositPayload = serde_json::from_slice(&payload_json)?;
+    let payload: DepositPayload = serde_json::from_slice(payload_bytes)?;
 
     let now = crate::config::epoch_secs() as i64;
     if payload.expires_at <= now {
