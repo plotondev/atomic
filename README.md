@@ -208,6 +208,15 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 
 ## Changelog
 
+**1ba345e** — DashMap rate limiter, flock PID locking, jemalloc opt-in, connection leak detection
+- Replace `Mutex<HashMap>` rate limiter with `DashMap` (sharded locks, no global contention under high concurrency)
+- PID file locking via `flock` prevents double-start races; lock auto-released on crash by kernel
+- Optional jemalloc allocator (`--features jemalloc`) for long-lived Linux deployments to prevent RSS bloat
+- `PooledConn` tracks hold time, warns on connections held >30s (leak detection)
+- Panic hook cleans up PID file on fatal panic
+- `PRAGMA optimize` added to hourly cleanup for SQLite query planner stats
+- Rate limiter eviction moved from hot path to background cleanup (`DashMap::len()` check replaces per-request `retain`)
+
 **a609534** — Exponential backoff for supervised tasks, deposit_log retention
 - `spawn_supervised` uses exponential backoff (5s → 10s → ... → 320s cap) instead of fixed 5s delay to prevent spin loops on persistent failures (e.g. disk full)
 - Cleanup task purges `deposit_log` entries older than 90 days to prevent unbounded disk growth on long-lived servers
