@@ -15,7 +15,7 @@ pub fn host(code: &str, expires_secs: u64) -> Result<()> {
     }
     let max_secs: u64 = 3600; // 1 hour max for magic links
     let capped_secs = expires_secs.min(max_secs);
-    let expires_at = chrono::Utc::now().timestamp()
+    let expires_at = crate::config::epoch_secs() as i64
         + i64::try_from(capped_secs).map_err(|_| anyhow::anyhow!("Duration too large"))?;
 
     let code_hash = hash_code(code);
@@ -36,7 +36,7 @@ pub fn host(code: &str, expires_secs: u64) -> Result<()> {
 
 pub fn list() -> Result<()> {
     let conn = db::open()?;
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::config::epoch_secs() as i64;
 
     // clean expired
     conn.execute("DELETE FROM magic_links WHERE expires_at <= ?1", [now])?;
@@ -67,7 +67,7 @@ pub fn claim_with_conn(code: &str, conn: &rusqlite::Connection) -> Option<String
     use rusqlite::OptionalExtension;
     use subtle::ConstantTimeEq;
 
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::config::epoch_secs() as i64;
     let code_hash = hash_code(code);
 
     // Fetch the stored hash first (SELECT), then compare in constant time.
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn claim_valid_code() {
         let conn = test_db();
-        let future = chrono::Utc::now().timestamp() + 300;
+        let future = crate::config::epoch_secs() as i64 + 300;
         insert_code(&conn, "abc12345", future);
         assert_eq!(claim_with_conn("abc12345", &conn), Some("abc12345".to_string()));
     }
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn claim_expired_code() {
         let conn = test_db();
-        let past = chrono::Utc::now().timestamp() - 10;
+        let past = crate::config::epoch_secs() as i64 - 10;
         insert_code(&conn, "expired!", past);
         assert!(claim_with_conn("expired!", &conn).is_none());
     }
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn claim_one_time_use() {
         let conn = test_db();
-        let future = chrono::Utc::now().timestamp() + 300;
+        let future = crate::config::epoch_secs() as i64 + 300;
         insert_code(&conn, "onceonly", future);
         assert!(claim_with_conn("onceonly", &conn).is_some());
         assert!(claim_with_conn("onceonly", &conn).is_none());
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn wrong_code_does_not_match() {
         let conn = test_db();
-        let future = chrono::Utc::now().timestamp() + 300;
+        let future = crate::config::epoch_secs() as i64 + 300;
         insert_code(&conn, "correct!", future);
         assert!(claim_with_conn("wrongone", &conn).is_none());
     }

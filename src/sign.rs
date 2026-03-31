@@ -17,7 +17,7 @@ pub fn run(command: &[String], dry_run: bool) -> Result<()> {
     // Extract the request body from the command.
     // Looks for -d/--data/--data-raw and grabs the next arg.
     let body = extract_body(command);
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = crate::config::epoch_secs() as i64;
 
     // Sign: "{timestamp}.{body}"
     let message = format!("{timestamp}.{body}");

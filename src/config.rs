@@ -93,6 +93,35 @@ pub fn acquire_pid_lock(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
+/// Current UTC time as Unix epoch seconds. Single syscall, no allocation.
+pub fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Format a Unix timestamp as RFC 3339 UTC (e.g. "2024-01-15T12:30:00Z").
+/// Uses the Hinnant civil_from_days algorithm. No chrono dependency.
+pub fn format_rfc3339(epoch: i64) -> String {
+    let secs = epoch.rem_euclid(86400) as u32;
+    let days = epoch.div_euclid(86400) as i32;
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146097 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i32 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let h = secs / 3600;
+    let min = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
+}
+
 pub fn ensure_atomic_dir() -> Result<PathBuf> {
     let dir = atomic_dir()?;
     if !dir.exists() {
@@ -143,5 +172,23 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         assert!(dir.starts_with(&home));
         assert!(dir.ends_with(".atomic"));
+    }
+
+    #[test]
+    fn format_rfc3339_epoch_zero() {
+        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn format_rfc3339_known_date() {
+        // 2024-01-01T00:00:00Z
+        assert_eq!(format_rfc3339(1704067200), "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn epoch_secs_is_reasonable() {
+        let now = epoch_secs();
+        assert!(now > 1_700_000_000); // after 2023
+        assert!(now < 4_000_000_000); // before 2096
     }
 }

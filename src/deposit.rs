@@ -24,7 +24,7 @@ pub fn create_signed_token(
     let nonce = generate_nonce();
     let max_expiry: u64 = 24 * 3600; // 24 hours
     let secs = expires_in.as_secs().min(max_expiry);
-    let expires_at = chrono::Utc::now().timestamp() + i64::try_from(secs)
+    let expires_at = crate::config::epoch_secs() as i64 + i64::try_from(secs)
         .map_err(|_| anyhow::anyhow!("Duration too large"))?;
 
     let payload = DepositPayload {
@@ -75,7 +75,7 @@ fn try_verify_signature(
     let payload_json = B64URL.decode(payload_b64)?;
     let payload: DepositPayload = serde_json::from_slice(&payload_json)?;
 
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::config::epoch_secs() as i64;
     if payload.expires_at <= now {
         anyhow::bail!("Token expired (expires_at={}, now={})", payload.expires_at, now);
     }
@@ -88,7 +88,7 @@ pub fn claim_nonce_with_conn(
     payload: &DepositPayload,
     conn: &rusqlite::Connection,
 ) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::config::epoch_secs() as i64;
     let inserted = conn.prepare_cached(
         "INSERT OR IGNORE INTO used_deposits (nonce, label, used_at) VALUES (?1, ?2, ?3)",
     )?.execute(
@@ -109,7 +109,7 @@ pub fn log_deposit(
     source_ip: &str,
     user_agent: &str,
 ) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::config::epoch_secs() as i64;
     conn.prepare_cached(
         "INSERT INTO deposit_log (label, source_ip, user_agent, deposited_at) VALUES (?1, ?2, ?3, ?4)",
     )?.execute(
@@ -140,9 +140,7 @@ pub fn list_deposits(label_filter: Option<&str>) -> Result<()> {
         let ip: String = row.get(1)?;
         let ua: String = row.get(2)?;
         let ts: i64 = row.get(3)?;
-        let time = chrono::DateTime::from_timestamp(ts, 0)
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_else(|| ts.to_string());
+        let time = crate::config::format_rfc3339(ts);
         println!("{time}  {label}");
         println!("  IP:         {ip}");
         if !ua.is_empty() {
@@ -241,7 +239,7 @@ mod tests {
         let (payload_b64, _) = token.split_once('.').unwrap();
         let payload_json = B64URL.decode(payload_b64).unwrap();
         let payload: DepositPayload = serde_json::from_slice(&payload_json).unwrap();
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::config::epoch_secs() as i64;
         // Should be capped at ~24h, not 48h
         assert!(payload.expires_at <= now + 24 * 3600 + 5);
         assert!(payload.expires_at > now + 23 * 3600); // but at least ~23h
@@ -261,7 +259,7 @@ mod tests {
         let payload = DepositPayload {
             label: "test".into(),
             nonce: "unique_nonce_123".into(),
-            expires_at: chrono::Utc::now().timestamp() + 300,
+            expires_at: crate::config::epoch_secs() as i64 + 300,
         };
         assert!(claim_nonce_with_conn(&payload, &conn).is_ok());
     }
@@ -272,7 +270,7 @@ mod tests {
         let payload = DepositPayload {
             label: "test".into(),
             nonce: "replay_nonce".into(),
-            expires_at: chrono::Utc::now().timestamp() + 300,
+            expires_at: crate::config::epoch_secs() as i64 + 300,
         };
         claim_nonce_with_conn(&payload, &conn).unwrap();
         let err = claim_nonce_with_conn(&payload, &conn).unwrap_err();

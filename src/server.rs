@@ -11,7 +11,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use zeroize::Zeroizing;
@@ -35,10 +34,7 @@ const DB_CIRCUIT_COOLDOWN_SECS: u64 = 60;
 const RATE_SHARDS: usize = 8;
 
 fn epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    config::epoch_secs()
 }
 
 /// Const lookup table for printable ASCII validation.
@@ -179,11 +175,6 @@ struct DepositResponse {
     label: String,
 }
 
-#[derive(Serialize)]
-struct MagicLinkResponse {
-    status: &'static str,
-}
-
 /// Max deposit body size: 64 KB — sufficient for secrets, API keys, certs.
 /// Tighter than the original 1MB to limit allocation before input validation.
 const MAX_BODY_SIZE: usize = 64 * 1024;
@@ -237,7 +228,9 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
 
     let behind_proxy = credentials.proxy;
 
-    let state = Arc::new(AppState {
+    // Box::leak: AppState lives for the entire process, so leaking avoids
+    // Arc's atomic refcount increment/decrement on every request handler clone.
+    let state: &'static AppState = Box::leak(Box::new(AppState {
         agent_json_cached,
         verifying_key,
         vault_key,
@@ -247,15 +240,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         rate_limiter: RateLimiter::new(),
         in_flight: std::sync::atomic::AtomicUsize::new(0),
         last_db_failure: std::sync::atomic::AtomicU64::new(0),
-    });
+    }));
 
     // Background task: WAL checkpoint every 5 minutes (PASSIVE to avoid blocking writers;
     // the hourly cleanup task runs TRUNCATE to actually reclaim WAL disk space).
-    let wal_state = state.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-            let db_ref = wal_state.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 let wal_large = crate::config::atomic_dir()
                     .map(|d| d.join("atomic.db-wal"))
@@ -264,7 +255,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                     .map(|m| m.len() > 40 * 1024 * 1024)
                     .unwrap_or(false);
 
-                match db_ref.db_pool.get() {
+                match state.db_pool.get() {
                     Ok(conn) => {
                         if wal_large {
                             tracing::warn!("WAL exceeds 40MB, forcing TRUNCATE checkpoint");
@@ -283,20 +274,18 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
     });
 
     // Background task: clean expired magic links, old deposit nonces, stale rate limiter entries hourly
-    let cleanup_state = state.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            let db_ref = cleanup_state.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                let conn = match db_ref.db_pool.get() {
+                let conn = match state.db_pool.get() {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!("DB cleanup: pool exhausted: {e}");
                         return;
                     }
                 };
-                let now = chrono::Utc::now().timestamp();
+                let now = epoch_secs() as i64;
                 // Paginated deletes: batch 1000 rows at a time to avoid holding
                 // the WAL write lock for extended periods under heavy load.
                 loop {
@@ -340,7 +329,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 let _ = conn.execute_batch("PRAGMA optimize;");
             }).await;
             // Clean stale rate limiter entries (non-blocking, quick lock per shard)
-            cleanup_state.rate_limiter.clean_stale();
+            state.rate_limiter.clean_stale();
         }
     });
 
@@ -351,7 +340,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let shutdown_state = state.clone();
+    let shutdown_state = state;
 
     let public_routes = Router::new()
         .route("/.well-known/agent.json", get(serve_agent_json))
@@ -365,13 +354,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .route("/_/health", get(handle_health))
         .fallback(handle_404)
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            state,
             track_in_flight,
         ))
         .layer(middleware::from_fn(request_timeout))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            state,
             security_headers,
         ))
         .with_state(state);
@@ -488,7 +477,7 @@ async fn root_redirect() -> Redirect {
     Redirect::temporary("/.well-known/agent.json")
 }
 
-async fn serve_agent_json(State(state): State<Arc<AppState>>) -> Response {
+async fn serve_agent_json(State(state): State<&'static AppState>) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -499,7 +488,7 @@ async fn serve_agent_json(State(state): State<Arc<AppState>>) -> Response {
 
 // Verify the signed token, store the POST body in the vault under the encoded label.
 async fn handle_deposit(
-    State(state): State<Arc<AppState>>,
+    State(state): State<&'static AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(token): Path<String>,
@@ -556,16 +545,15 @@ async fn handle_deposit(
         .to_string();
 
     // DB operations in spawn_blocking with timeout to prevent unbounded task accumulation.
-    // Access vault_key via the Arc<AppState> reference inside the closure
+    // Access vault_key via the &'static AppState reference inside the closure
     // to avoid copying the key out of its Zeroizing wrapper.
-    let state_clone = state.clone();
     let body_clone = body;
     let deposit_result = tokio::time::timeout(
         DB_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            let conn = state_clone.db_pool.get()?;
+            let conn = state.db_pool.get()?;
             crate::deposit::claim_nonce_with_conn(&payload, &conn)?;
-            crate::vault::vault_set_with_conn(&conn, &payload.label, &body_clone, state_clone.vault_key())?;
+            crate::vault::vault_set_with_conn(&conn, &payload.label, &body_clone, state.vault_key())?;
             crate::deposit::log_deposit(&conn, &payload.label, &source_ip, &user_agent)?;
             Ok::<_, anyhow::Error>(payload.label)
         })
@@ -605,7 +593,7 @@ async fn handle_deposit(
 }
 
 async fn handle_magic_link(
-    State(state): State<Arc<AppState>>,
+    State(state): State<&'static AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(code): Path<String>,
 ) -> Response {
@@ -626,12 +614,11 @@ async fn handle_magic_link(
         return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "30")]).into_response();
     }
 
-    let state_clone = state.clone();
     let code_clone = code;
     let result = tokio::time::timeout(
         DB_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            let conn = state_clone.db_pool.get()?;
+            let conn = state.db_pool.get()?;
             Ok::<_, anyhow::Error>(crate::magic_link::claim_with_conn(&code_clone, &conn))
         })
     ).await;
@@ -644,11 +631,7 @@ async fn handle_magic_link(
         }
         Ok(Ok(Ok(Some(_)))) => {
             state.record_db_success();
-            let resp = MagicLinkResponse { status: "verified" };
-            match serde_json::to_string(&resp) {
-                Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
-                Err(_) => StatusCode::NOT_FOUND.into_response(),
-            }
+            (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], r#"{"status":"verified"}"#).into_response()
         }
         Ok(Ok(Ok(None))) => {
             state.record_db_success();
@@ -667,13 +650,12 @@ async fn handle_magic_link(
     }
 }
 
-async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
+async fn handle_health(State(state): State<&'static AppState>) -> Response {
     // Check DB is responsive (with timeout)
     let db_ok = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         tokio::task::spawn_blocking({
-            let st = state.clone();
-            move || match st.db_pool.get() {
+            move || match state.db_pool.get() {
                 Ok(conn) => conn.execute_batch("SELECT 1").is_ok(),
                 Err(_) => false,
             }
@@ -719,7 +701,7 @@ async fn handle_404() -> StatusCode {
 
 /// Track in-flight requests for graceful shutdown drain.
 async fn track_in_flight(
-    State(state): State<Arc<AppState>>,
+    State(state): State<&'static AppState>,
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
@@ -741,7 +723,7 @@ async fn request_timeout(
 }
 
 async fn security_headers(
-    State(state): State<Arc<AppState>>,
+    State(state): State<&'static AppState>,
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {

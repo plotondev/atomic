@@ -19,7 +19,7 @@ pub fn vault_set(label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
     vault_set_with_conn(&conn, label, value, vault_key)
 }
 
-pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<Zeroizing<String>>> {
+pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<Zeroizing<Box<str>>>> {
     let conn = db::open()?;
     let mut stmt = conn
         .prepare("SELECT value FROM vault_secrets WHERE label = ?1")
@@ -32,12 +32,13 @@ pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<Zeroizing<S
     match result {
         Some(encrypted) => {
             let plaintext = crypto_vault::decrypt(vault_key, &encrypted)?;
-            // Convert to String and wrap in Zeroizing so the heap copy is wiped on drop,
-            // not left as cleartext in freed memory.
+            // Box<str> is 2 words (ptr, len) vs String's 3 (ptr, len, cap).
+            // No slack capacity means zeroize wipes exactly the used bytes.
             let value = Zeroizing::new(
                 std::str::from_utf8(&plaintext)
                     .context("Vault value is not valid UTF-8")?
-                    .to_string(),
+                    .to_string()
+                    .into_boxed_str(),
             );
             Ok(Some(value))
         }
