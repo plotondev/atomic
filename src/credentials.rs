@@ -65,16 +65,21 @@ impl Credentials {
     }
 
     pub fn signing_key(&self) -> Result<SigningKey> {
-        signing::decode_private_key(&self.private_key)
+        Ok(signing::decode_private_key(&self.private_key)?)
     }
 
     pub fn verifying_key(&self) -> Result<VerifyingKey> {
-        signing::decode_public_key(&self.public_key)
+        Ok(signing::decode_public_key(&self.public_key)?)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self).context("Failed to serialize credentials")?;
-        crate::config::write_secure(path, json.as_bytes())
+        // Write directly into a Zeroizing<Vec<u8>> so the private key material
+        // in the serialized JSON is zeroed on drop, not left in freed heap memory.
+        let mut buf = zeroize::Zeroizing::new(Vec::new());
+        serde_json::to_writer_pretty(&mut *buf, self).context("Failed to serialize credentials")?;
+        // Eliminate capacity slack so Zeroizing wipes all bytes containing key material.
+        buf.shrink_to_fit();
+        crate::config::write_secure(path, &buf)
     }
 
     pub fn load(path: &Path) -> Result<Self> {

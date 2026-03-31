@@ -1,6 +1,5 @@
 use anyhow::Result;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-use base64::Engine;
+use base64ct::{Base64UrlUnpadded, Encoding};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -24,7 +23,7 @@ pub fn create_signed_token(
     let nonce = generate_nonce();
     let max_expiry: u64 = 24 * 3600; // 24 hours
     let secs = expires_in.as_secs().min(max_expiry);
-    let expires_at = chrono::Utc::now().timestamp() + i64::try_from(secs)
+    let expires_at = crate::config::epoch_secs() as i64 + i64::try_from(secs)
         .map_err(|_| anyhow::anyhow!("Duration too large"))?;
 
     let payload = DepositPayload {
@@ -34,53 +33,46 @@ pub fn create_signed_token(
     };
 
     let payload_json = serde_json::to_string(&payload)?;
-    let payload_b64 = B64URL.encode(payload_json.as_bytes());
+    let payload_b64 = Base64UrlUnpadded::encode_string(payload_json.as_bytes());
     let sig = signing::sign(signing_key, payload_b64.as_bytes());
-    let sig_b64 = B64URL.encode(sig.to_bytes());
+    let sig_b64 = Base64UrlUnpadded::encode_string(&sig.to_bytes());
 
     Ok(format!("{payload_b64}.{sig_b64}"))
 }
 
 /// Verify signature and expiry only (no DB access). Returns the payload if valid.
+/// Zero-allocation on failure — prevents DoS via invalid-request heap pressure.
+/// Silent on failure — no logging to prevent timing attacks and information leakage.
 pub fn verify_signature(
     token: &str,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Option<DepositPayload> {
-    match try_verify_signature(token, verifying_key) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::debug!("Deposit verify failed: {}", e);
-            None
-        }
+    let (payload_b64, sig_b64) = token.split_once('.')?;
+
+    // Stack-allocated signature decode (zero heap allocation)
+    let mut sig_buf = [0u8; 64];
+    let sig_decoded = Base64UrlUnpadded::decode(sig_b64, &mut sig_buf).ok()?;
+    if sig_decoded.len() != 64 {
+        return None;
     }
-}
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_buf);
 
-fn try_verify_signature(
-    token: &str,
-    verifying_key: &ed25519_dalek::VerifyingKey,
-) -> Result<DepositPayload> {
-    let (payload_b64, sig_b64) = token
-        .split_once('.')
-        .ok_or_else(|| anyhow::anyhow!("No '.' separator in token"))?;
-
-    let sig_bytes = B64URL.decode(sig_b64)?;
-    let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
-        .map_err(|e| anyhow::anyhow!("Bad signature bytes: {e}"))?;
-
-    use ed25519_dalek::Verifier;
     verifying_key
-        .verify(payload_b64.as_bytes(), &sig)
-        .map_err(|e| anyhow::anyhow!("Signature invalid: {e}"))?;
+        .verify_strict(payload_b64.as_bytes(), &sig)
+        .ok()?;
 
-    let payload_json = B64URL.decode(payload_b64)?;
-    let payload: DepositPayload = serde_json::from_slice(&payload_json)?;
+    // Stack-allocated payload decode (zero heap allocation).
+    // DepositPayload JSON is well under 768 bytes (label≤256 + nonce=32 + overhead).
+    let mut payload_buf = [0u8; 1024];
+    let payload_bytes = Base64UrlUnpadded::decode(payload_b64, &mut payload_buf).ok()?;
+    let payload: DepositPayload = serde_json::from_slice(payload_bytes).ok()?;
 
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::config::epoch_secs() as i64;
     if payload.expires_at <= now {
-        anyhow::bail!("Token expired (expires_at={}, now={})", payload.expires_at, now);
+        return None;
     }
 
-    Ok(payload)
+    Some(payload)
 }
 
 /// Claim the nonce using a provided connection reference.
@@ -88,9 +80,10 @@ pub fn claim_nonce_with_conn(
     payload: &DepositPayload,
     conn: &rusqlite::Connection,
 ) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
-    let inserted = conn.execute(
+    let now = crate::config::epoch_secs() as i64;
+    let inserted = conn.prepare_cached(
         "INSERT OR IGNORE INTO used_deposits (nonce, label, used_at) VALUES (?1, ?2, ?3)",
+    )?.execute(
         rusqlite::params![payload.nonce, payload.label, now],
     )?;
 
@@ -108,9 +101,10 @@ pub fn log_deposit(
     source_ip: &str,
     user_agent: &str,
 ) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
-    conn.execute(
+    let now = crate::config::epoch_secs() as i64;
+    conn.prepare_cached(
         "INSERT INTO deposit_log (label, source_ip, user_agent, deposited_at) VALUES (?1, ?2, ?3, ?4)",
+    )?.execute(
         rusqlite::params![label, source_ip, user_agent, now],
     )?;
     Ok(())
@@ -138,9 +132,7 @@ pub fn list_deposits(label_filter: Option<&str>) -> Result<()> {
         let ip: String = row.get(1)?;
         let ua: String = row.get(2)?;
         let ts: i64 = row.get(3)?;
-        let time = chrono::DateTime::from_timestamp(ts, 0)
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_else(|| ts.to_string());
+        let time = crate::config::format_rfc3339(ts);
         println!("{time}  {label}");
         println!("  IP:         {ip}");
         if !ua.is_empty() {
@@ -160,54 +152,13 @@ fn generate_nonce() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
-// Accepts "10m", "1h", "30s".
-pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
-    let s = s.trim();
-    if s.is_empty() {
-        anyhow::bail!("Empty duration string");
-    }
-
-    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('m') {
-        (n, 60)
-    } else if let Some(n) = s.strip_suffix('h') {
-        (n, 3600)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1)
-    } else {
-        anyhow::bail!("Duration must end with 's' (seconds), 'm' (minutes), or 'h' (hours)");
-    };
-
-    let num: u64 = num_str
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid number in duration: '{num_str}'"))?;
-
-    Ok(Duration::from_secs(
-        num.checked_mul(multiplier)
-            .ok_or_else(|| anyhow::anyhow!("Duration too large"))?,
-    ))
+    Base64UrlUnpadded::encode_string(&bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::signing as s;
-
-    #[test]
-    fn parse_duration_values() {
-        assert_eq!(parse_duration("10m").unwrap(), Duration::from_secs(600));
-        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
-        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn parse_duration_rejects_garbage() {
-        assert!(parse_duration("").is_err());
-        assert!(parse_duration("10x").is_err());
-        assert!(parse_duration("abc").is_err());
-    }
 
     #[test]
     fn signed_token_roundtrip() {
@@ -219,7 +170,7 @@ mod tests {
 
         // Decode the payload part to verify contents
         let (payload_b64, _) = token.split_once('.').unwrap();
-        let payload_json = B64URL.decode(payload_b64).unwrap();
+        let payload_json = Base64UrlUnpadded::decode_vec(payload_b64).unwrap();
         let payload: DepositPayload = serde_json::from_slice(&payload_json).unwrap();
         assert_eq!(payload.label, "test_key");
         assert!(!payload.nonce.is_empty());
@@ -278,24 +229,12 @@ mod tests {
         let (sk, _) = s::generate_keypair();
         let token = create_signed_token("key", Duration::from_secs(48 * 3600), &sk).unwrap();
         let (payload_b64, _) = token.split_once('.').unwrap();
-        let payload_json = B64URL.decode(payload_b64).unwrap();
+        let payload_json = Base64UrlUnpadded::decode_vec(payload_b64).unwrap();
         let payload: DepositPayload = serde_json::from_slice(&payload_json).unwrap();
-        let now = chrono::Utc::now().timestamp();
+        let now = crate::config::epoch_secs() as i64;
         // Should be capped at ~24h, not 48h
         assert!(payload.expires_at <= now + 24 * 3600 + 5);
         assert!(payload.expires_at > now + 23 * 3600); // but at least ~23h
-    }
-
-    #[test]
-    fn parse_duration_zero_values() {
-        assert_eq!(parse_duration("0s").unwrap(), Duration::from_secs(0));
-        assert_eq!(parse_duration("0m").unwrap(), Duration::from_secs(0));
-        assert_eq!(parse_duration("0h").unwrap(), Duration::from_secs(0));
-    }
-
-    #[test]
-    fn parse_duration_trims_whitespace() {
-        assert_eq!(parse_duration("  10m  ").unwrap(), Duration::from_secs(600));
     }
 
     fn test_db() -> rusqlite::Connection {
@@ -312,7 +251,7 @@ mod tests {
         let payload = DepositPayload {
             label: "test".into(),
             nonce: "unique_nonce_123".into(),
-            expires_at: chrono::Utc::now().timestamp() + 300,
+            expires_at: crate::config::epoch_secs() as i64 + 300,
         };
         assert!(claim_nonce_with_conn(&payload, &conn).is_ok());
     }
@@ -323,7 +262,7 @@ mod tests {
         let payload = DepositPayload {
             label: "test".into(),
             nonce: "replay_nonce".into(),
-            expires_at: chrono::Utc::now().timestamp() + 300,
+            expires_at: crate::config::epoch_secs() as i64 + 300,
         };
         claim_nonce_with_conn(&payload, &conn).unwrap();
         let err = claim_nonce_with_conn(&payload, &conn).unwrap_err();

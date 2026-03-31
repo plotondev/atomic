@@ -64,9 +64,9 @@ pub enum Command {
         #[arg(long)]
         label: String,
 
-        /// Expiry duration (e.g., 10m, 1h)
-        #[arg(long, default_value = "10m")]
-        expires: String,
+        /// Expiry in seconds (max 86400)
+        #[arg(long, default_value = "600")]
+        expires: u64,
     },
 
     /// Show deposit audit log
@@ -82,12 +82,6 @@ pub enum Command {
         command: VaultCommand,
     },
 
-    /// Host a verification code for domain proof
-    MagicLink {
-        #[command(subcommand)]
-        command: MagicLinkCommand,
-    },
-
     /// Sign an outgoing HTTP request
     Sign {
         /// Print modified command without executing
@@ -97,18 +91,6 @@ pub enum Command {
         /// The command to wrap (e.g., curl ...)
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
-    },
-
-    /// Key management
-    Key {
-        #[command(subcommand)]
-        command: KeyCommand,
-    },
-
-    /// Systemd service management
-    Service {
-        #[command(subcommand)]
-        command: ServiceCommand,
     },
 }
 
@@ -133,36 +115,4 @@ pub enum VaultCommand {
         /// Label of the secret to delete
         label: String,
     },
-}
-
-#[derive(Subcommand)]
-pub enum MagicLinkCommand {
-    /// Host a code for a service to verify
-    Host {
-        /// The verification code to host
-        code: String,
-        /// How long to host it (e.g., 5m, 10m)
-        #[arg(long, default_value = "5m")]
-        expires: String,
-    },
-    /// List active magic links
-    List,
-}
-
-#[derive(Subcommand)]
-pub enum KeyCommand {
-    /// Rotate the agent's keypair
-    Rotate,
-    /// Emergency revoke the agent's identity
-    Revoke,
-}
-
-#[derive(Subcommand)]
-pub enum ServiceCommand {
-    /// Install as systemd service
-    Install,
-    /// Uninstall systemd service
-    Uninstall,
-    /// Show service status
-    Status,
 }

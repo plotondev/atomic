@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
+use base64ct::{Base64, Encoding};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use zeroize::Zeroizing;
+
+use super::CryptoError;
 
 pub fn generate_keypair() -> (SigningKey, VerifyingKey) {
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -23,46 +23,50 @@ pub fn verify(verifying_key: &VerifyingKey, message: &[u8], signature: &Signatur
 
 // Wire format: "ed25519:<base64 bytes>"
 pub fn encode_public_key(verifying_key: &VerifyingKey) -> String {
-    format!("ed25519:{}", BASE64.encode(verifying_key.as_bytes()))
+    format!("ed25519:{}", Base64::encode_string(verifying_key.as_bytes()))
 }
 
-pub fn decode_public_key(encoded: &str) -> Result<VerifyingKey> {
+pub fn decode_public_key(encoded: &str) -> Result<VerifyingKey, CryptoError> {
     let b64 = encoded
         .strip_prefix("ed25519:")
-        .context("Public key must start with 'ed25519:'")?;
-    let bytes = BASE64.decode(b64).context("Invalid base64 in public key")?;
-    let key_bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Public key must be 32 bytes"))?;
-    VerifyingKey::from_bytes(&key_bytes).context("Invalid Ed25519 public key")
+        .ok_or(CryptoError::InvalidKey)?;
+    // Stack-allocated decode: no heap allocation for 32-byte key.
+    let mut buf = [0u8; 32];
+    let decoded = Base64::decode(b64, &mut buf).map_err(|_| CryptoError::InvalidKey)?;
+    if decoded.len() != 32 {
+        return Err(CryptoError::InvalidKey);
+    }
+    VerifyingKey::from_bytes(&buf).map_err(|_| CryptoError::InvalidKey)
 }
 
 pub fn encode_private_key(signing_key: &SigningKey) -> String {
     let key_bytes = Zeroizing::new(signing_key.to_bytes());
-    BASE64.encode(*key_bytes)
+    Base64::encode_string(&*key_bytes)
 }
 
-pub fn decode_private_key(encoded: &str) -> Result<SigningKey> {
-    let bytes = Zeroizing::new(BASE64.decode(encoded).context("Invalid base64 in private key")?);
-    if bytes.len() != 32 {
-        anyhow::bail!("Private key must be 32 bytes");
-    }
+pub fn decode_private_key(encoded: &str) -> Result<SigningKey, CryptoError> {
+    // Stack-allocated decode directly into Zeroizing — no intermediate Vec.
     let mut key_bytes = Zeroizing::new([0u8; 32]);
-    key_bytes.copy_from_slice(&bytes);
+    let decoded = Base64::decode(encoded, key_bytes.as_mut()).map_err(|_| CryptoError::InvalidKey)?;
+    if decoded.len() != 32 {
+        return Err(CryptoError::InvalidKey);
+    }
     Ok(SigningKey::from_bytes(&key_bytes))
 }
 
 pub fn encode_signature(signature: &Signature) -> String {
-    BASE64.encode(signature.to_bytes())
+    Base64::encode_string(&signature.to_bytes())
 }
 
 #[allow(dead_code)]
-pub fn decode_signature(encoded: &str) -> Result<Signature> {
-    let bytes = BASE64.decode(encoded).context("Invalid base64 in signature")?;
-    let sig_bytes: [u8; 64] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Signature must be 64 bytes"))?;
-    Ok(Signature::from_bytes(&sig_bytes))
+pub fn decode_signature(encoded: &str) -> Result<Signature, CryptoError> {
+    // Stack-allocated decode: no heap allocation for 64-byte signature.
+    let mut buf = [0u8; 64];
+    let decoded = Base64::decode(encoded, &mut buf).map_err(|_| CryptoError::InvalidSignature)?;
+    if decoded.len() != 64 {
+        return Err(CryptoError::InvalidSignature);
+    }
+    Ok(Signature::from_bytes(&buf))
 }
 
 #[cfg(test)]
@@ -131,7 +135,7 @@ mod tests {
 
     #[test]
     fn decode_public_key_wrong_length() {
-        let short = BASE64.encode([0u8; 16]); // 16 bytes, need 32
+        let short = Base64::encode_string(&[0u8; 16]); // 16 bytes, need 32
         assert!(decode_public_key(&format!("ed25519:{short}")).is_err());
     }
 
@@ -142,13 +146,13 @@ mod tests {
 
     #[test]
     fn decode_private_key_wrong_length() {
-        let short = BASE64.encode([0u8; 16]);
+        let short = Base64::encode_string(&[0u8; 16]);
         assert!(decode_private_key(&short).is_err());
     }
 
     #[test]
     fn decode_signature_wrong_length() {
-        let short = BASE64.encode([0u8; 32]); // 32 bytes, need 64
+        let short = Base64::encode_string(&[0u8; 32]); // 32 bytes, need 64
         assert!(decode_signature(&short).is_err());
     }
 

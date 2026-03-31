@@ -1,59 +1,66 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, AeadInPlace, KeyInit},
     Aes256Gcm, Nonce,
 };
-use anyhow::{Context, Result};
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
+use super::CryptoError;
+
 const NONCE_SIZE: usize = 12;
 const HKDF_SALT: &[u8] = b"atomic-v1";
+const MAX_CIPHERTEXT_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 // HKDF with salt and "atomic-vault" context, so the vault key differs from the signing key.
-pub fn derive_vault_key(private_key_bytes: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
+pub fn derive_vault_key(private_key_bytes: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), private_key_bytes);
     let mut key = Zeroizing::new([0u8; 32]);
     hk.expand(b"atomic-vault", key.as_mut())
-        .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
+        .map_err(|_| CryptoError::KeyDerivationFailed)?;
     Ok(key)
 }
 
 // Output: 12-byte nonce prepended to ciphertext.
-pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
+        .map_err(|_| CryptoError::EncryptionFailed)?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
-
-    let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-    Ok(result)
+    // Single allocation, exact size: nonce(12) + ciphertext(len) + tag(16).
+    // encrypt_in_place_detached avoids the intermediate Vec that Aead::encrypt allocates.
+    let mut out = Vec::with_capacity(NONCE_SIZE + plaintext.len() + 16);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(plaintext);
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, b"", &mut out[NONCE_SIZE..])
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+    out.extend_from_slice(&tag);
+    Ok(out)
 }
 
 // Expects 12-byte nonce prepended to ciphertext (same format encrypt() produces).
-pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
-    if data.len() < NONCE_SIZE {
-        anyhow::bail!("Encrypted data too short");
+// Returns Zeroizing<Box<[u8]>> — into_boxed_slice() guarantees capacity == len,
+// so Zeroizing wipes the entire allocation with no unzeroed slack bytes.
+pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Zeroizing<Box<[u8]>>, CryptoError> {
+    if data.len() < NONCE_SIZE || data.len() > MAX_CIPHERTEXT_SIZE {
+        return Err(CryptoError::InvalidCiphertext);
     }
 
     let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
     let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
+        .map_err(|_| CryptoError::InvalidCiphertext)?;
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    cipher
+    let plaintext = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow::anyhow!("Decryption failed (wrong key or corrupted data)"))
-        .context("Vault decryption failed")
+        .map_err(|_| CryptoError::InvalidCiphertext)?;
+
+    Ok(Zeroizing::new(plaintext.into_boxed_slice()))
 }
 
 #[cfg(test)]
@@ -66,7 +73,7 @@ mod tests {
         let plaintext = b"secret data here";
         let encrypted = encrypt(&key, plaintext).unwrap();
         let decrypted = decrypt(&key, &encrypted).unwrap();
-        assert_eq!(plaintext.to_vec(), decrypted);
+        assert_eq!(plaintext.as_slice(), &**decrypted);
     }
 
     #[test]
@@ -108,11 +115,18 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_oversized_rejected() {
+        let key = [42u8; 32];
+        let oversized = vec![0u8; MAX_CIPHERTEXT_SIZE + 1];
+        assert!(matches!(decrypt(&key, &oversized), Err(CryptoError::InvalidCiphertext)));
+    }
+
+    #[test]
     fn encrypt_decrypt_empty_plaintext() {
         let key = [42u8; 32];
         let encrypted = encrypt(&key, b"").unwrap();
         let decrypted = decrypt(&key, &encrypted).unwrap();
-        assert!(decrypted.is_empty());
+        assert!((*decrypted).is_empty());
     }
 
     #[test]

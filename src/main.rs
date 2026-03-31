@@ -6,23 +6,41 @@ mod crypto;
 mod db;
 mod deposit;
 mod init;
-mod magic_link;
 mod server;
 mod sign;
 mod tls;
 mod vault;
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use cli::{Cli, Command, KeyCommand, MagicLinkCommand, ServiceCommand, VaultCommand};
+use cli::{Cli, Command, VaultCommand};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("atomic=info".parse()?))
         .init();
+
+    // Enable jemalloc background thread for aggressive memory purging.
+    // Ensures freed allocations (including zeroed key material) are returned
+    // to the OS promptly instead of lingering in allocator caches.
+    #[cfg(feature = "jemalloc")]
+    {
+        if let Err(e) = tikv_jemalloc_ctl::background_thread::write(true) {
+            tracing::warn!("Failed to enable jemalloc background thread: {e}");
+        }
+    }
+
+    // Panic hook removed: file I/O in panic handlers is async-signal-unsafe
+    // (deadlock risk if panic occurred during malloc or file operation).
+    // The kernel automatically releases flock on the PID file when the process exits.
+    // Temp files from write_secure are cleaned on next startup or OS reboot.
 
     let cli = Cli::parse();
 
@@ -46,45 +64,48 @@ async fn main() -> Result<()> {
         }
 
         Command::Stop => {
+            use fs2::FileExt;
+
             let pid_path = config::pid_path()?;
             if !pid_path.exists() {
                 anyhow::bail!("No running server found (no PID file)");
             }
-            let pid_str = std::fs::read_to_string(&pid_path)?;
-            let pid: i32 = pid_str.trim().parse().context("Invalid PID file")?;
-            if pid <= 0 {
-                let _ = std::fs::remove_file(&pid_path);
-                anyhow::bail!("Invalid PID {pid} in PID file (removed)");
-            }
 
-            // Verify the PID belongs to an atomic process before killing
-            let ps_output = std::process::Command::new("ps")
-                .args(["-p", &pid.to_string(), "-o", "comm="])
-                .output();
-            if let Ok(output) = ps_output {
-                let comm = String::from_utf8_lossy(&output.stdout);
-                let comm = comm.trim();
-                if !comm.is_empty() && !comm.contains("atomic") {
+            // Use flock to atomically determine if the server process is alive.
+            // The running server holds an exclusive flock on the PID file.
+            // This eliminates the TOCTOU race window from ps/kill -0 checks.
+            let pid_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pid_path)
+                .context("Failed to open PID file")?;
+
+            match pid_file.try_lock_exclusive() {
+                Ok(()) => {
+                    // We got the lock — the server process is dead (kernel released its lock).
+                    drop(pid_file);
                     let _ = std::fs::remove_file(&pid_path);
-                    anyhow::bail!(
-                        "PID {pid} belongs to '{comm}', not atomic (stale PID file removed)"
-                    );
+                    println!("Cleaned up stale PID file (server was not running)");
                 }
-            }
+                Err(_) => {
+                    // Lock held by live server process — read PID and send SIGTERM.
+                    let pid_str = std::fs::read_to_string(&pid_path)?;
+                    let pid: i32 = pid_str.trim().parse().context("Invalid PID file")?;
+                    if pid <= 0 {
+                        anyhow::bail!("Invalid PID {pid} in PID file");
+                    }
 
-            // Send SIGTERM
-            let status = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status()
-                .context("Failed to send stop signal")?;
+                    let status = std::process::Command::new("kill")
+                        .arg(pid.to_string())
+                        .status()
+                        .context("Failed to send SIGTERM")?;
 
-            if status.success() {
-                let _ = std::fs::remove_file(&pid_path);
-                println!("Server stopped (PID {pid})");
-            } else {
-                // Process might already be gone
-                let _ = std::fs::remove_file(&pid_path);
-                println!("Server process {pid} not found (cleaned up stale PID file)");
+                    if status.success() {
+                        println!("Server stopped (PID {pid})");
+                    } else {
+                        println!("Failed to stop server (PID {pid})");
+                    }
+                }
             }
         }
 
@@ -135,7 +156,7 @@ async fn main() -> Result<()> {
             let creds_path = config::credentials_path()?;
             let creds = credentials::Credentials::load(&creds_path)?;
             let signing_key = creds.signing_key()?;
-            let duration = deposit::parse_duration(&expires)?;
+            let duration = std::time::Duration::from_secs(expires);
             let token = deposit::create_signed_token(&label, duration, &signing_key)?;
             let url = format!("{}/d/{}", creds.base_url(), token);
             println!("{url}");
@@ -172,31 +193,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::MagicLink { command } => match command {
-            MagicLinkCommand::Host { code, expires } => {
-                magic_link::host(&code, &expires)?;
-            }
-            MagicLinkCommand::List => {
-                magic_link::list()?;
-            }
-        },
-
         Command::Sign { dry_run, command } => {
             sign::run(&command, dry_run)?;
         }
-
-        Command::Key { command } => match command {
-            KeyCommand::Rotate => println!("Key rotation not yet implemented (PLO-58)"),
-            KeyCommand::Revoke => println!("Key revocation not yet implemented (PLO-58)"),
-        },
-
-        Command::Service { command } => match command {
-            ServiceCommand::Install => println!("Service install not yet implemented (PLO-59)"),
-            ServiceCommand::Uninstall => {
-                println!("Service uninstall not yet implemented (PLO-59)")
-            }
-            ServiceCommand::Status => println!("Service status not yet implemented (PLO-59)"),
-        },
     }
 
     Ok(())

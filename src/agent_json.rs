@@ -22,7 +22,7 @@ impl AgentJson {
             public_key: public_key.to_string(),
             status: "active".to_string(),
             deposit: format!("{base_url}/d/"),
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: crate::config::format_rfc3339(crate::config::epoch_secs() as i64),
         }
     }
 

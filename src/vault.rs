@@ -1,15 +1,16 @@
 use anyhow::{bail, Context, Result};
+use zeroize::Zeroizing;
 
 use crate::crypto::vault as crypto_vault;
 use crate::db;
 
 pub fn vault_set_with_conn(conn: &rusqlite::Connection, label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
     let encrypted = crypto_vault::encrypt(vault_key, value.as_bytes())?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR REPLACE INTO vault_secrets (label, value) VALUES (?1, ?2)",
+    )?.execute(
         rusqlite::params![label, encrypted],
-    )
-    .context("Failed to store secret")?;
+    ).context("Failed to store secret")?;
     Ok(())
 }
 
@@ -18,7 +19,7 @@ pub fn vault_set(label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
     vault_set_with_conn(&conn, label, value, vault_key)
 }
 
-pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<String>> {
+pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<Zeroizing<Box<str>>>> {
     let conn = db::open()?;
     let mut stmt = conn
         .prepare("SELECT value FROM vault_secrets WHERE label = ?1")
@@ -31,7 +32,14 @@ pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<String>> {
     match result {
         Some(encrypted) => {
             let plaintext = crypto_vault::decrypt(vault_key, &encrypted)?;
-            let value = String::from_utf8(plaintext).context("Vault value is not valid UTF-8")?;
+            // Box<str> is 2 words (ptr, len) vs String's 3 (ptr, len, cap).
+            // No slack capacity means zeroize wipes exactly the used bytes.
+            let value = Zeroizing::new(
+                std::str::from_utf8(&plaintext)
+                    .context("Vault value is not valid UTF-8")?
+                    .to_string()
+                    .into_boxed_str(),
+            );
             Ok(Some(value))
         }
         None => Ok(None),
@@ -71,9 +79,16 @@ pub fn vault_count() -> Result<usize> {
     Ok(count as usize)
 }
 
+/// Reject labels with non-printable characters or excessive length.
+fn is_valid_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 256
+        && s.bytes().all(|b| b >= 0x20 && b != 0x7F)
+}
+
 pub fn cmd_set(label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
-    if label.is_empty() || label.len() > 256 {
-        bail!("Label must be non-empty and at most 256 characters");
+    if !is_valid_label(label) {
+        bail!("Label must be non-empty, at most 256 printable characters");
     }
     vault_set(label, value, vault_key)?;
     println!("Stored '{label}'");
@@ -83,7 +98,7 @@ pub fn cmd_set(label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
 pub fn cmd_get(label: &str, vault_key: &[u8; 32]) -> Result<()> {
     match vault_get(label, vault_key)? {
         Some(value) => {
-            print!("{value}"); // no trailing newline, so it works in $()
+            print!("{}", &*value); // no trailing newline, so it works in $()
             Ok(())
         }
         None => bail!("Label '{label}' not found in vault"),
@@ -136,7 +151,7 @@ mod tests {
         let mut stmt = conn.prepare("SELECT value FROM vault_secrets WHERE label = ?1").unwrap();
         let encrypted: Vec<u8> = stmt.query_row(["api_key"], |row| row.get(0)).unwrap();
         let decrypted = cv::decrypt(&key, &encrypted).unwrap();
-        assert_eq!(String::from_utf8(decrypted).unwrap(), "sk-12345");
+        assert_eq!(std::str::from_utf8(&decrypted).unwrap(), "sk-12345");
     }
 
     #[test]
@@ -148,7 +163,7 @@ mod tests {
         let mut stmt = conn.prepare("SELECT value FROM vault_secrets WHERE label = ?1").unwrap();
         let encrypted: Vec<u8> = stmt.query_row(["k"], |row| row.get(0)).unwrap();
         let decrypted = cv::decrypt(&key, &encrypted).unwrap();
-        assert_eq!(String::from_utf8(decrypted).unwrap(), "v2");
+        assert_eq!(std::str::from_utf8(&decrypted).unwrap(), "v2");
     }
 
     #[test]
