@@ -74,9 +74,16 @@ pub fn vault_count() -> Result<usize> {
     Ok(count as usize)
 }
 
+/// Reject labels with non-printable characters or excessive length.
+fn is_valid_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 256
+        && s.bytes().all(|b| b >= 0x20 && b != 0x7F)
+}
+
 pub fn cmd_set(label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
-    if label.is_empty() || label.len() > 256 {
-        bail!("Label must be non-empty and at most 256 characters");
+    if !is_valid_label(label) {
+        bail!("Label must be non-empty, at most 256 printable characters");
     }
     vault_set(label, value, vault_key)?;
     println!("Stored '{label}'");

@@ -34,6 +34,12 @@ impl Drop for PooledConn<'_> {
     fn drop(&mut self) {
         if let Some(c) = self.conn.take() {
             let held = self.acquired_at.elapsed();
+            if held > Duration::from_secs(60) {
+                // Force-close stale connections rather than returning to pool.
+                // Prevents connection leaks from panicked threads or stuck queries.
+                tracing::warn!("SQLite connection held for {:?}, dropping instead of returning to pool", held);
+                return;
+            }
             if held > Duration::from_secs(30) {
                 tracing::warn!("SQLite connection held for {:?}, possible leak", held);
             }

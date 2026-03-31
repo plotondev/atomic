@@ -11,6 +11,7 @@ name = "atomic"
 path = "src/main.rs"
 
 [features]
+default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]

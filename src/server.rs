@@ -392,17 +392,24 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         }
     }
 
-    // Final WAL checkpoint before exit to ensure all data is merged
-    let _ = tokio::task::spawn_blocking(move || {
-        match shutdown_state.db_pool.get() {
-            Ok(conn) => {
-                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                    tracing::warn!("Final WAL checkpoint failed: {e}");
+    // Final WAL checkpoint before exit to ensure all data is merged.
+    // Timeout prevents indefinite hang if the DB is stuck.
+    let checkpoint_result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            match shutdown_state.db_pool.get() {
+                Ok(conn) => {
+                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                        tracing::warn!("Final WAL checkpoint failed: {e}");
+                    }
                 }
+                Err(e) => tracing::warn!("Final WAL checkpoint skipped: {e}"),
             }
-            Err(e) => tracing::warn!("Final WAL checkpoint skipped: {e}"),
-        }
-    }).await;
+        })
+    ).await;
+    if checkpoint_result.is_err() {
+        tracing::error!("Final WAL checkpoint timed out (5s) — data is consistent but may remain in WAL file");
+    }
 
     let _ = std::fs::remove_file(&pid_path);
     info!("Server stopped");
