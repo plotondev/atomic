@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use serde::Serialize;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
@@ -117,7 +118,11 @@ pub struct AppState {
     pub behind_proxy: bool,
     /// Sharded concurrent map — no global mutex contention under high concurrency.
     /// Uses monotonic Instant (not wall clock) to prevent clock-skew manipulation.
-    rate_limiter: DashMap<IpAddr, (u32, std::time::Instant)>,
+    /// FxHasher: IP keys are not attacker-hashed, so collision resistance is unnecessary;
+    /// ~2-3x faster than SipHash on rate-limit hot paths.
+    rate_limiter: DashMap<IpAddr, (u32, std::time::Instant), rustc_hash::FxBuildHasher>,
+    /// In-flight request counter for graceful shutdown drain.
+    in_flight: std::sync::atomic::AtomicUsize,
     /// Global rate limit for magic link claims (epoch second of current window).
     magic_link_window: std::sync::atomic::AtomicI64,
     /// Count of magic link claims in the current 1-second window.
@@ -163,13 +168,15 @@ impl AppState {
     }
 
     /// Record a DB operation failure. Opens the circuit after DB_CIRCUIT_THRESHOLD consecutive failures.
+    /// Uses Relaxed for the hot-path counter increment; Release on the state transition
+    /// so that `is_db_circuit_open` (Acquire) sees a consistent fail_count + opened_at pair.
     fn record_db_failure(&self) {
-        let count = self.db_fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let count = self.db_fail_count.fetch_add(1, Ordering::Relaxed) + 1;
         if count >= DB_CIRCUIT_THRESHOLD {
             let now = epoch_secs();
-            let prev = self.db_circuit_opened_at.load(std::sync::atomic::Ordering::Relaxed);
+            let prev = self.db_circuit_opened_at.load(Ordering::Acquire);
             if prev == 0 {
-                self.db_circuit_opened_at.store(now, std::sync::atomic::Ordering::Relaxed);
+                self.db_circuit_opened_at.store(now, Ordering::Release);
                 tracing::error!("DB circuit breaker OPEN after {count} consecutive failures");
             }
         }
@@ -177,16 +184,16 @@ impl AppState {
 
     /// Record a successful DB operation. Resets the circuit breaker.
     fn record_db_success(&self) {
-        self.db_fail_count.store(0, std::sync::atomic::Ordering::Relaxed);
-        if self.db_circuit_opened_at.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-            self.db_circuit_opened_at.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.db_fail_count.store(0, Ordering::Release);
+        if self.db_circuit_opened_at.load(Ordering::Acquire) != 0 {
+            self.db_circuit_opened_at.store(0, Ordering::Release);
             tracing::info!("DB circuit breaker closed after successful operation");
         }
     }
 
     /// Returns true if the circuit is open (DB operations should be rejected).
     fn is_db_circuit_open(&self) -> bool {
-        let opened_at = self.db_circuit_opened_at.load(std::sync::atomic::Ordering::Relaxed);
+        let opened_at = self.db_circuit_opened_at.load(Ordering::Acquire);
         if opened_at == 0 {
             return false;
         }
@@ -198,13 +205,13 @@ impl AppState {
     /// Prevents distributed brute-force even if each IP stays under per-IP limits.
     fn check_magic_link_global_rate(&self) -> bool {
         let now = chrono::Utc::now().timestamp();
-        let window = self.magic_link_window.load(std::sync::atomic::Ordering::Relaxed);
+        let window = self.magic_link_window.load(Ordering::Relaxed);
         if window != now {
-            self.magic_link_window.store(now, std::sync::atomic::Ordering::Relaxed);
-            self.magic_link_count.store(1, std::sync::atomic::Ordering::Relaxed);
+            self.magic_link_window.store(now, Ordering::Relaxed);
+            self.magic_link_count.store(1, Ordering::Relaxed);
             return true;
         }
-        let count = self.magic_link_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let count = self.magic_link_count.fetch_add(1, Ordering::Relaxed);
         count < MAGIC_LINK_GLOBAL_MAX_PER_SEC
     }
 }
@@ -220,8 +227,9 @@ struct MagicLinkResponse {
     status: &'static str,
 }
 
-/// Max deposit body size: 1 MB
-const MAX_BODY_SIZE: usize = 1024 * 1024;
+/// Max deposit body size: 64 KB — sufficient for secrets, API keys, certs.
+/// Tighter than the original 1MB to limit allocation before input validation.
+const MAX_BODY_SIZE: usize = 64 * 1024;
 
 pub async fn run_server(credentials: Credentials) -> Result<()> {
     // --- Startup checks ---
@@ -307,7 +315,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         db_pool,
         tls_active,
         behind_proxy,
-        rate_limiter: DashMap::with_capacity(256),
+        rate_limiter: DashMap::with_capacity_and_hasher(256, rustc_hash::FxBuildHasher),
+        in_flight: std::sync::atomic::AtomicUsize::new(0),
         magic_link_window: std::sync::atomic::AtomicI64::new(0),
         magic_link_count: std::sync::atomic::AtomicU32::new(0),
         db_fail_count: std::sync::atomic::AtomicU32::new(0),
@@ -458,6 +467,10 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .route("/m/{code}", get(handle_magic_link))
         .route("/_/health", get(handle_health))
         .fallback(handle_404)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_in_flight,
+        ))
         .layer(middleware::from_fn(request_timeout))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .layer(middleware::from_fn_with_state(
@@ -532,7 +545,25 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         }
     }
 
-    // Final WAL checkpoint before exit to ensure all data is merged.
+    // Drain phase: wait for in-flight requests to complete before checkpointing WAL.
+    // The graceful shutdown above stops new connections; this ensures handlers finish.
+    {
+        let drain_start = std::time::Instant::now();
+        let drain_timeout = std::time::Duration::from_secs(30);
+        loop {
+            let remaining = shutdown_state.in_flight.load(Ordering::Relaxed);
+            if remaining == 0 {
+                break;
+            }
+            if drain_start.elapsed() > drain_timeout {
+                tracing::warn!("Drain timeout: {remaining} requests still in-flight");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    // Final WAL checkpoint after all handlers have drained.
     // Timeout prevents indefinite hang if the DB is stuck.
     let checkpoint_result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -794,6 +825,18 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
 
 async fn handle_404() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+/// Track in-flight requests for graceful shutdown drain.
+async fn track_in_flight(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    state.in_flight.fetch_add(1, Ordering::Relaxed);
+    let resp = next.run(req).await;
+    state.in_flight.fetch_sub(1, Ordering::Relaxed);
+    resp
 }
 
 /// Global request timeout (30s) — defense-in-depth against slow clients or stuck handlers.

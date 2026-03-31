@@ -28,6 +28,16 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("atomic=info".parse()?))
         .init();
 
+    // Enable jemalloc background thread for aggressive memory purging.
+    // Ensures freed allocations (including zeroed key material) are returned
+    // to the OS promptly instead of lingering in allocator caches.
+    #[cfg(feature = "jemalloc")]
+    {
+        if let Err(e) = tikv_jemalloc_ctl::background_thread::write(true) {
+            tracing::warn!("Failed to enable jemalloc background thread: {e}");
+        }
+    }
+
     // Clean up PID file and temp files on panic (best-effort).
     // With panic=abort in release, the hook still runs before the process terminates.
     std::panic::set_hook(Box::new(|info| {

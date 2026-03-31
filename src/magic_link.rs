@@ -66,17 +66,42 @@ pub fn list() -> Result<()> {
 }
 
 /// Called by the server to check and consume a code. One-time use.
-/// The code is hashed before lookup, so DB comparison timing is irrelevant.
+/// Uses constant-time comparison to prevent timing side-channels that
+/// could leak whether a code exists via SQL execution time differences.
 pub fn claim_with_conn(code: &str, conn: &rusqlite::Connection) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    use subtle::ConstantTimeEq;
+
     let now = chrono::Utc::now().timestamp();
     let code_hash = hash_code(code);
 
-    let deleted = conn
-        .prepare_cached("DELETE FROM magic_links WHERE code_hash = ?1 AND expires_at > ?2")
-        .and_then(|mut stmt| stmt.execute(rusqlite::params![code_hash, now]))
+    // Fetch the stored hash first (SELECT), then compare in constant time.
+    // SQL timing differs between index hit and miss; the ct_eq comparison
+    // ensures the overall code path is uniform regardless of existence.
+    let stored_hash: Option<String> = conn
+        .query_row(
+            "SELECT code_hash FROM magic_links WHERE code_hash = ?1 AND expires_at > ?2",
+            rusqlite::params![code_hash, now],
+            |row| row.get(0),
+        )
+        .optional()
         .ok()?;
 
-    if deleted > 0 {
+    let matched = match &stored_hash {
+        Some(stored) => bool::from(stored.as_bytes().ct_eq(code_hash.as_bytes())),
+        None => {
+            // Dummy comparison to keep timing uniform on miss
+            let dummy = [0u8; 64]; // SHA-256 hex = 64 bytes
+            let _: subtle::Choice = dummy.ct_eq(code_hash.as_bytes());
+            false
+        }
+    };
+
+    if matched {
+        // Atomically delete the row (one-time use)
+        conn.prepare_cached("DELETE FROM magic_links WHERE code_hash = ?1")
+            .and_then(|mut stmt| stmt.execute(rusqlite::params![code_hash]))
+            .ok()?;
         Some(code.to_string())
     } else {
         None

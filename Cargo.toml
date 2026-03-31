@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = ["jemalloc"]
-jemalloc = ["dep:tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [dependencies]
 # CLI
@@ -69,7 +69,11 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 dashmap = "6"
 fs2 = "0.4"
 tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
 libc = "0.2"
+subtle = "2"
+rustc-hash = "2"
+notify = "7"
 
 [profile.release]
 opt-level = 3

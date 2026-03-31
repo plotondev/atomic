@@ -58,7 +58,16 @@ impl Drop for PooledConn<'_> {
                 tracing::warn!("Returning connection with active transaction, rolling back");
                 let _ = c.execute_batch("ROLLBACK");
             }
-            let _ = self.pool.sender.try_send((c, self.created_at));
+            // Panic-safe pool return: catch any panic during channel send to prevent
+            // double-panic abort (which would skip remaining destructors and Zeroizing).
+            let sender = &self.pool.sender;
+            let created = self.created_at;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = sender.try_send((c, created));
+            }));
+            if result.is_err() {
+                tracing::error!("Panic while returning connection to pool (connection leaked)");
+            }
         }
     }
 }
