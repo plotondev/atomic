@@ -201,12 +201,19 @@ All responses get `nosniff`, `no-store`, and `no-referrer` headers. HSTS (2-year
 git clone https://github.com/ploton/atomic.git
 cd atomic
 cargo build --release    # ~4MB binary
-cargo test               # 65 tests
+cargo test               # 68 tests
 ```
 
 Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`.
 
 ## Changelog
+
+**e61756c** — Box::leak AppState (kill Arc refcount), drop chrono (epoch_secs + Hinnant RFC3339), Box<str> vault secrets, static magic-link JSON response
+- `server.rs`: replace `Arc<AppState>` with `Box::leak` for `&'static AppState` — eliminates atomic refcount increment/decrement on every request handler clone. AppState is process-lifetime singleton, leaking is zero-cost.
+- `server.rs`: remove `MagicLinkResponse` struct — magic link JSON response is now a static string literal (`r#"{"status":"verified"}"#`), removing serde serialization from the hot path.
+- Drop `chrono` crate entirely — replace all `chrono::Utc::now().timestamp()` with `config::epoch_secs()` (single syscall, no allocation). RFC 3339 formatting uses Hinnant civil_from_days algorithm in `config::format_rfc3339()` (cold path only, ~20 lines).
+- `vault.rs`: `vault_get` returns `Zeroizing<Box<str>>` instead of `Zeroizing<String>` — 2 words (ptr, len) vs 3 (ptr, len, cap), no slack capacity means zeroize wipes exactly the used bytes.
+- Net: −91 lines, −1 dependency (chrono), 68 tests passing.
 
 **ae91eaf** — Remove notify crate, kill spawn_supervised, single-atomic circuit breaker, drop global magic link rate limit, branchless input validation, 256MB mmap
 - Remove `notify` crate: cert renewal watcher replaced with 6-hour polling + SIGHUP for immediate reload (zero extra threads for a cert that changes every 60 days)
