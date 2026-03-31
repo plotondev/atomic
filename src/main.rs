@@ -38,26 +38,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Clean up PID file and temp files on panic (best-effort).
-    // With panic=abort in release, the hook still runs before the process terminates.
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("atomic: fatal panic: {info}");
-        if let Ok(path) = config::pid_path() {
-            let _ = std::fs::remove_file(path);
-        }
-        // Clean temp files left by write_secure (atomic write pattern)
-        if let Ok(dir) = config::atomic_dir() {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if name.contains(".tmp.") {
-                            let _ = std::fs::remove_file(entry.path());
-                        }
-                    }
-                }
-            }
-        }
-    }));
+    // Panic hook removed: file I/O in panic handlers is async-signal-unsafe
+    // (deadlock risk if panic occurred during malloc or file operation).
+    // The kernel automatically releases flock on the PID file when the process exits.
+    // Temp files from write_secure are cleaned on next startup or OS reboot.
 
     let cli = Cli::parse();
 
@@ -81,54 +65,48 @@ async fn main() -> Result<()> {
         }
 
         Command::Stop => {
+            use fs2::FileExt;
+
             let pid_path = config::pid_path()?;
             if !pid_path.exists() {
                 anyhow::bail!("No running server found (no PID file)");
             }
-            let pid_str = std::fs::read_to_string(&pid_path)?;
-            let pid: i32 = pid_str.trim().parse().context("Invalid PID file")?;
-            if pid <= 0 {
-                let _ = std::fs::remove_file(&pid_path);
-                anyhow::bail!("Invalid PID {pid} in PID file (removed)");
-            }
 
-            // Verify the PID belongs to an atomic process before killing
-            let ps_output = std::process::Command::new("ps")
-                .args(["-p", &pid.to_string(), "-o", "comm="])
-                .output();
-            if let Ok(output) = ps_output {
-                let comm = String::from_utf8_lossy(&output.stdout);
-                let comm = comm.trim();
-                if !comm.is_empty() && !comm.contains("atomic") {
+            // Use flock to atomically determine if the server process is alive.
+            // The running server holds an exclusive flock on the PID file.
+            // This eliminates the TOCTOU race window from ps/kill -0 checks.
+            let pid_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pid_path)
+                .context("Failed to open PID file")?;
+
+            match pid_file.try_lock_exclusive() {
+                Ok(()) => {
+                    // We got the lock — the server process is dead (kernel released its lock).
+                    drop(pid_file);
                     let _ = std::fs::remove_file(&pid_path);
-                    anyhow::bail!(
-                        "PID {pid} belongs to '{comm}', not atomic (stale PID file removed)"
-                    );
+                    println!("Cleaned up stale PID file (server was not running)");
                 }
-            }
+                Err(_) => {
+                    // Lock held by live server process — read PID and send SIGTERM.
+                    let pid_str = std::fs::read_to_string(&pid_path)?;
+                    let pid: i32 = pid_str.trim().parse().context("Invalid PID file")?;
+                    if pid <= 0 {
+                        anyhow::bail!("Invalid PID {pid} in PID file");
+                    }
 
-            // Verify process still alive immediately before kill to minimize PID reuse window
-            let probe = std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .status();
-            if !probe.map(|s| s.success()).unwrap_or(false) {
-                let _ = std::fs::remove_file(&pid_path);
-                anyhow::bail!("PID {pid} no longer exists (stale PID file removed)");
-            }
+                    let status = std::process::Command::new("kill")
+                        .arg(pid.to_string())
+                        .status()
+                        .context("Failed to send SIGTERM")?;
 
-            // Send SIGTERM
-            let status = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status()
-                .context("Failed to send stop signal")?;
-
-            if status.success() {
-                let _ = std::fs::remove_file(&pid_path);
-                println!("Server stopped (PID {pid})");
-            } else {
-                // Process might already be gone
-                let _ = std::fs::remove_file(&pid_path);
-                println!("Server process {pid} not found (cleaned up stale PID file)");
+                    if status.success() {
+                        println!("Server stopped (PID {pid})");
+                    } else {
+                        println!("Failed to stop server (PID {pid})");
+                    }
+                }
             }
         }
 

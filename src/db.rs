@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,7 @@ pub struct DbPool {
     conns: Mutex<Vec<(Connection, Instant)>>,
     available: Condvar,
     db_path: PathBuf,
+    shutdown: AtomicBool,
 }
 
 /// RAII guard that returns the connection to the pool on drop.
@@ -73,10 +75,20 @@ impl Drop for PooledConn<'_> {
 }
 
 impl DbPool {
+    /// Signal the pool to reject new acquisitions and wake all waiting threads.
+    /// Called during graceful shutdown to prevent threads from blocking on Condvar.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.available.notify_all();
+    }
+
     /// Get a connection from the pool, blocking up to 5 seconds.
     /// Connections older than 30 minutes are recycled to reset SQLite's
     /// internal allocator and prevent page cache fragmentation.
     pub fn get(&self) -> Result<PooledConn<'_>> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            anyhow::bail!("DB pool shutting down");
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -98,6 +110,9 @@ impl DbPool {
                     created_at,
                     acquired_at: Instant::now(),
                 });
+            }
+            if self.shutdown.load(Ordering::SeqCst) {
+                anyhow::bail!("DB pool shutting down");
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -172,6 +187,7 @@ pub fn open_pool(size: usize) -> Result<DbPool> {
         conns: Mutex::new(conns),
         available: Condvar::new(),
         db_path,
+        shutdown: AtomicBool::new(false),
     })
 }
 

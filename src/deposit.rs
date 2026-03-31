@@ -1,6 +1,5 @@
 use anyhow::Result;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-use base64::Engine;
+use base64ct::{Base64UrlUnpadded, Encoding};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -34,9 +33,9 @@ pub fn create_signed_token(
     };
 
     let payload_json = serde_json::to_string(&payload)?;
-    let payload_b64 = B64URL.encode(payload_json.as_bytes());
+    let payload_b64 = Base64UrlUnpadded::encode_string(payload_json.as_bytes());
     let sig = signing::sign(signing_key, payload_b64.as_bytes());
-    let sig_b64 = B64URL.encode(sig.to_bytes());
+    let sig_b64 = Base64UrlUnpadded::encode_string(&sig.to_bytes());
 
     Ok(format!("{payload_b64}.{sig_b64}"))
 }
@@ -58,10 +57,11 @@ fn try_verify_signature(
         .split_once('.')
         .ok_or_else(|| anyhow::anyhow!("No '.' separator in token"))?;
 
-    // Decode signature into stack-allocated buffer (zero heap allocation)
+    // Decode signature into stack-allocated buffer (zero heap allocation, constant-time)
     let mut sig_buf = [0u8; 64];
-    let sig_len = B64URL.decode_slice(sig_b64, &mut sig_buf)
-        .map_err(|e| anyhow::anyhow!("Bad signature: {e}"))?;
+    let sig_len = Base64UrlUnpadded::decode(sig_b64, &mut sig_buf)
+        .map_err(|_| anyhow::anyhow!("Bad signature encoding"))?
+        .len();
     if sig_len != 64 {
         anyhow::bail!("Signature must be 64 bytes, got {sig_len}");
     }
@@ -72,7 +72,8 @@ fn try_verify_signature(
         .verify(payload_b64.as_bytes(), &sig)
         .map_err(|e| anyhow::anyhow!("Signature invalid: {e}"))?;
 
-    let payload_json = B64URL.decode(payload_b64)?;
+    let payload_json = Base64UrlUnpadded::decode_vec(payload_b64)
+        .map_err(|_| anyhow::anyhow!("Bad payload encoding"))?;
     let payload: DepositPayload = serde_json::from_slice(&payload_json)?;
 
     let now = crate::config::epoch_secs() as i64;
@@ -178,7 +179,7 @@ mod tests {
 
         // Decode the payload part to verify contents
         let (payload_b64, _) = token.split_once('.').unwrap();
-        let payload_json = B64URL.decode(payload_b64).unwrap();
+        let payload_json = Base64UrlUnpadded::decode_vec(payload_b64).unwrap();
         let payload: DepositPayload = serde_json::from_slice(&payload_json).unwrap();
         assert_eq!(payload.label, "test_key");
         assert!(!payload.nonce.is_empty());
@@ -237,7 +238,7 @@ mod tests {
         let (sk, _) = s::generate_keypair();
         let token = create_signed_token("key", Duration::from_secs(48 * 3600), &sk).unwrap();
         let (payload_b64, _) = token.split_once('.').unwrap();
-        let payload_json = B64URL.decode(payload_b64).unwrap();
+        let payload_json = Base64UrlUnpadded::decode_vec(payload_b64).unwrap();
         let payload: DepositPayload = serde_json::from_slice(&payload_json).unwrap();
         let now = crate::config::epoch_secs() as i64;
         // Should be capped at ~24h, not 48h

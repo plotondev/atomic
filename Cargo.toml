@@ -42,7 +42,7 @@ sha2 = "0.10"
 
 # Random + encoding
 rand = "0.8"
-base64 = "0.22"
+base64ct = { version = "1", features = ["alloc"] }
 hex = "0.4"
 
 # HTTP client (for verify command)

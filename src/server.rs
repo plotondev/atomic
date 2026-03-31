@@ -15,9 +15,15 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 use zeroize::Zeroizing;
 
+use std::sync::OnceLock;
+
 use crate::config;
 use crate::credentials::Credentials;
 use crate::tls::TlsMode;
+
+/// Global AppState — initialized once via OnceLock instead of Box::leak.
+/// Provides &'static access without leaking heap memory.
+static APP_STATE: OnceLock<AppState> = OnceLock::new();
 
 /// Timeout for DB operations in HTTP handlers. Must exceed SQLite busy_timeout (4s)
 /// so that SQLite returns BUSY cleanly before the task gets force-cancelled.
@@ -86,9 +92,13 @@ impl RateLimiter {
     fn check(&self, ip: IpAddr) -> bool {
         let now = std::time::Instant::now();
         let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
-        let mut shard = self.shards[Self::shard_index(&ip)]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Fail open: if shard lock is contested, allow the request rather than block.
+        // A locked shard indicates system stress; blocking increases backlog.
+        let mut shard = match self.shards[Self::shard_index(&ip)].try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => return true,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
         // Hard cap per shard to prevent unbounded growth
         if shard.len() >= RATE_LIMIT_MAX_ENTRIES / RATE_SHARDS {
             let stale = shard.iter()
@@ -228,9 +238,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
 
     let behind_proxy = credentials.proxy;
 
-    // Box::leak: AppState lives for the entire process, so leaking avoids
-    // Arc's atomic refcount increment/decrement on every request handler clone.
-    let state: &'static AppState = Box::leak(Box::new(AppState {
+    APP_STATE.set(AppState {
         agent_json_cached,
         verifying_key,
         vault_key,
@@ -240,7 +248,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         rate_limiter: RateLimiter::new(),
         in_flight: std::sync::atomic::AtomicUsize::new(0),
         last_db_failure: std::sync::atomic::AtomicU64::new(0),
-    }));
+    }).map_err(|_| anyhow::anyhow!("server already initialized"))?;
+    let state: &'static AppState = APP_STATE.get().unwrap();
 
     // Background task: WAL checkpoint every 5 minutes (PASSIVE to avoid blocking writers;
     // the hourly cleanup task runs TRUNCATE to actually reclaim WAL disk space).
@@ -443,6 +452,9 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
+
+    // Signal pool to reject new acquisitions and wake any threads waiting on Condvar.
+    shutdown_state.db_pool.shutdown();
 
     // Final WAL checkpoint after all handlers have drained.
     // Timeout prevents indefinite hang if the DB is stuck.
