@@ -179,7 +179,7 @@ async fn main() -> Result<()> {
             let creds_path = config::credentials_path()?;
             let creds = credentials::Credentials::load(&creds_path)?;
             let signing_key = creds.signing_key()?;
-            let duration = deposit::parse_duration(&expires)?;
+            let duration = std::time::Duration::from_secs(expires);
             let token = deposit::create_signed_token(&label, duration, &signing_key)?;
             let url = format!("{}/d/{}", creds.base_url(), token);
             println!("{url}");
@@ -218,7 +218,7 @@ async fn main() -> Result<()> {
 
         Command::MagicLink { command } => match command {
             MagicLinkCommand::Host { code, expires } => {
-                magic_link::host(&code, &expires)?;
+                magic_link::host(&code, expires)?;
             }
             MagicLinkCommand::List => {
                 magic_link::list()?;

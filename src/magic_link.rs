@@ -3,37 +3,34 @@ use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::db;
-use crate::deposit::parse_duration;
 
 fn hash_code(code: &str) -> String {
     let hash = Sha256::digest(code.as_bytes());
     hex::encode(hash)
 }
 
-pub fn host(code: &str, expires: &str) -> Result<()> {
+pub fn host(code: &str, expires_secs: u64) -> Result<()> {
     if code.len() < 20 {
         anyhow::bail!("Code must be at least 20 characters (got {}). Use a longer code to prevent brute-force.", code.len());
     }
-    let duration = parse_duration(expires)?;
     let max_secs: u64 = 3600; // 1 hour max for magic links
-    let capped_secs = duration.as_secs().min(max_secs);
+    let capped_secs = expires_secs.min(max_secs);
     let expires_at = chrono::Utc::now().timestamp()
         + i64::try_from(capped_secs).map_err(|_| anyhow::anyhow!("Duration too large"))?;
 
     let code_hash = hash_code(code);
-    let hint = &code[..2.min(code.len())];
 
     let conn = db::open()?;
     conn.execute(
-        "INSERT OR REPLACE INTO magic_links (code_hash, hint, expires_at) VALUES (?1, ?2, ?3)",
-        rusqlite::params![code_hash, hint, expires_at],
+        "INSERT OR REPLACE INTO magic_links (code_hash, expires_at) VALUES (?1, ?2)",
+        rusqlite::params![code_hash, expires_at],
     )?;
 
     let creds = crate::credentials::Credentials::load(&config::credentials_path()?)?;
     let url = format!("{}/m/{}", creds.base_url(), code);
 
     println!("{url}");
-    println!("Expires in {expires}. Service can verify at that URL.");
+    println!("Expires in {capped_secs}s. Service can verify at that URL.");
     Ok(())
 }
 
@@ -44,22 +41,20 @@ pub fn list() -> Result<()> {
     // clean expired
     conn.execute("DELETE FROM magic_links WHERE expires_at <= ?1", [now])?;
 
-    let mut stmt = conn.prepare("SELECT hint, expires_at FROM magic_links ORDER BY expires_at")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })?;
+    let mut stmt = conn.prepare("SELECT expires_at FROM magic_links ORDER BY expires_at")?;
+    let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
 
-    let mut found = false;
+    let mut idx = 0u32;
     for row in rows {
-        let (hint, expires_at) = row?;
+        let expires_at = row?;
         let remaining = expires_at - now;
         let mins = remaining / 60;
         let secs = remaining % 60;
-        println!("{hint}****  (expires in {mins}m {secs}s)");
-        found = true;
+        idx += 1;
+        println!("  #{idx} expires in {mins}m {secs}s");
     }
 
-    if !found {
+    if idx == 0 {
         println!("No active magic links.");
     }
     Ok(())
@@ -115,17 +110,16 @@ mod tests {
     fn test_db() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE magic_links (code_hash TEXT PRIMARY KEY, hint TEXT NOT NULL DEFAULT '', expires_at INTEGER NOT NULL);"
+            "CREATE TABLE magic_links (code_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);"
         ).unwrap();
         conn
     }
 
     fn insert_code(conn: &rusqlite::Connection, code: &str, expires_at: i64) {
         let code_hash = hash_code(code);
-        let hint = &code[..2.min(code.len())];
         conn.execute(
-            "INSERT INTO magic_links (code_hash, hint, expires_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![code_hash, hint, expires_at],
+            "INSERT INTO magic_links (code_hash, expires_at) VALUES (?1, ?2)",
+            rusqlite::params![code_hash, expires_at],
         ).unwrap();
     }
 

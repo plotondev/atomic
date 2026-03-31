@@ -64,9 +64,9 @@ pub enum Command {
         #[arg(long)]
         label: String,
 
-        /// Expiry duration (e.g., 10m, 1h)
-        #[arg(long, default_value = "10m")]
-        expires: String,
+        /// Expiry in seconds (max 86400)
+        #[arg(long, default_value = "600")]
+        expires: u64,
     },
 
     /// Show deposit audit log
@@ -141,9 +141,9 @@ pub enum MagicLinkCommand {
     Host {
         /// The verification code to host
         code: String,
-        /// How long to host it (e.g., 5m, 10m)
-        #[arg(long, default_value = "5m")]
-        expires: String,
+        /// How long to host it in seconds (max 3600)
+        #[arg(long, default_value = "300")]
+        expires: u64,
     },
     /// List active magic links
     List,

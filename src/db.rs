@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config;
@@ -11,12 +11,12 @@ use crate::config;
 const CONN_MAX_LIFETIME: Duration = Duration::from_secs(1800); // 30 minutes
 
 /// Zero-dependency connection pool for SQLite.
-/// Uses a bounded sync_channel to distribute pre-opened connections.
+/// Uses Mutex<Vec> + Condvar — minimal overhead for small pool sizes (2-8).
 /// WAL mode allows concurrent readers; the pool prevents serialization
 /// behind a single Mutex<Connection>.
 pub struct DbPool {
-    sender: mpsc::SyncSender<(Connection, Instant)>,
-    receiver: std::sync::Mutex<mpsc::Receiver<(Connection, Instant)>>,
+    conns: Mutex<Vec<(Connection, Instant)>>,
+    available: Condvar,
     db_path: PathBuf,
 }
 
@@ -58,12 +58,12 @@ impl Drop for PooledConn<'_> {
                 tracing::warn!("Returning connection with active transaction, rolling back");
                 let _ = c.execute_batch("ROLLBACK");
             }
-            // Panic-safe pool return: catch any panic during channel send to prevent
+            // Panic-safe pool return: catch any panic during mutex lock to prevent
             // double-panic abort (which would skip remaining destructors and Zeroizing).
-            let sender = &self.pool.sender;
-            let created = self.created_at;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = sender.try_send((c, created));
+                let mut conns = self.pool.conns.lock().unwrap_or_else(|e| e.into_inner());
+                conns.push((c, self.created_at));
+                self.pool.available.notify_one();
             }));
             if result.is_err() {
                 tracing::error!("Panic while returning connection to pool (connection leaked)");
@@ -77,29 +77,40 @@ impl DbPool {
     /// Connections older than 30 minutes are recycled to reset SQLite's
     /// internal allocator and prevent page cache fragmentation.
     pub fn get(&self) -> Result<PooledConn<'_>> {
-        let rx = self.receiver.lock().unwrap_or_else(|e| e.into_inner());
-        let (conn, created_at) = rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| anyhow::anyhow!("DB pool exhausted (5s timeout)"))?;
-
-        // Recycle stale connections to reset SQLite's internal allocator
-        if created_at.elapsed() > CONN_MAX_LIFETIME {
-            drop(conn);
-            let fresh = open_connection(&self.db_path)?;
-            return Ok(PooledConn {
-                pool: self,
-                conn: Some(fresh),
-                created_at: Instant::now(),
-                acquired_at: Instant::now(),
-            });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some((conn, created_at)) = conns.pop() {
+                if created_at.elapsed() > CONN_MAX_LIFETIME {
+                    drop(conn);
+                    drop(conns); // release lock during open_connection
+                    let fresh = open_connection(&self.db_path)?;
+                    return Ok(PooledConn {
+                        pool: self,
+                        conn: Some(fresh),
+                        created_at: Instant::now(),
+                        acquired_at: Instant::now(),
+                    });
+                }
+                return Ok(PooledConn {
+                    pool: self,
+                    conn: Some(conn),
+                    created_at,
+                    acquired_at: Instant::now(),
+                });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("DB pool exhausted (5s timeout)");
+            }
+            let (guard, result) = self.available
+                .wait_timeout(conns, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            conns = guard;
+            if result.timed_out() && conns.is_empty() {
+                anyhow::bail!("DB pool exhausted (5s timeout)");
+            }
         }
-
-        Ok(PooledConn {
-            pool: self,
-            conn: Some(conn),
-            created_at,
-            acquired_at: Instant::now(),
-        })
     }
 }
 
@@ -150,16 +161,16 @@ pub fn open_pool(size: usize) -> Result<DbPool> {
     migrate(&first)?;
 
     let now = Instant::now();
-    let (tx, rx) = mpsc::sync_channel(size);
-    tx.send((first, now)).expect("channel just created");
+    let mut conns = Vec::with_capacity(size);
+    conns.push((first, now));
 
     for _ in 1..size {
-        tx.send((open_connection(&db_path)?, now)).expect("channel just created");
+        conns.push((open_connection(&db_path)?, now));
     }
 
     Ok(DbPool {
-        sender: tx,
-        receiver: std::sync::Mutex::new(rx),
+        conns: Mutex::new(conns),
+        available: Condvar::new(),
         db_path,
     })
 }
@@ -174,12 +185,11 @@ pub fn open() -> Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    // Migrate magic_links from old schema (plaintext `code`) to new (hashed `code_hash`).
+    // Migrate magic_links from old schemas (plaintext `code` or `hint` column).
     // Magic links are short-lived, so dropping the table is safe.
-    let has_old_schema = conn
-        .prepare("SELECT code FROM magic_links LIMIT 0")
-        .is_ok();
-    if has_old_schema {
+    let needs_recreate = conn.prepare("SELECT code FROM magic_links LIMIT 0").is_ok()
+        || conn.prepare("SELECT hint FROM magic_links LIMIT 0").is_ok();
+    if needs_recreate {
         conn.execute_batch("DROP TABLE magic_links;")
             .context("Failed to migrate magic_links table")?;
     }
@@ -187,7 +197,6 @@ fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS magic_links (
             code_hash  TEXT PRIMARY KEY,
-            hint       TEXT NOT NULL DEFAULT '',
             expires_at INTEGER NOT NULL
         );
 

@@ -66,13 +66,10 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 bytes = "1"
 dirs = "6"
 zeroize = { version = "1.8.2", features = ["derive"] }
-dashmap = "6"
 fs2 = "0.4"
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
-libc = "0.2"
 subtle = "2"
-rustc-hash = "2"
 
 [profile.release]
 opt-level = 3

@@ -42,6 +42,10 @@ pub fn run(
         (None, Some(_)) => bail!("--tls-key requires --tls-cert"),
         _ => {}
     }
+    // Require explicit TLS config: either BYO certs or --no-tls
+    if !no_tls && tls_cert.is_none() {
+        bail!("TLS requires --tls-cert and --tls-key. Use --no-tls for plain HTTP (e.g., behind a reverse proxy).");
+    }
     if let Some(ref cert_path) = tls_cert {
         if !std::path::Path::new(cert_path).exists() {
             bail!("TLS certificate file not found: {cert_path}");

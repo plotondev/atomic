@@ -7,8 +7,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use dashmap::DashMap;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -32,6 +32,8 @@ const MAX_INPUT_LEN: usize = 256;
 /// Circuit breaker cool-down: DB operations rejected for this many seconds after last failure.
 const DB_CIRCUIT_COOLDOWN_SECS: u64 = 60;
 
+const RATE_SHARDS: usize = 8;
+
 fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -39,12 +41,89 @@ fn epoch_secs() -> u64 {
         .as_secs()
 }
 
+/// Const lookup table for printable ASCII validation.
+/// No branches per byte, cache-friendly, auto-vectorizes on x86_64.
+const ASCII_OK: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i: usize = 32; // space
+    while i <= 126 {
+        table[i] = true;
+        i += 1;
+    }
+    table
+};
+
 /// Reject inputs with non-printable or non-ASCII characters.
-/// `bytes().all()` is auto-vectorized on x86_64 (SSE/AVX) — no UTF-8 overhead.
 fn is_valid_input(s: &str) -> bool {
     s.len() > 0
         && s.len() <= MAX_INPUT_LEN
-        && s.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+        && s.bytes().all(|b| ASCII_OK[b as usize])
+}
+
+/// Sharded mutex rate limiter — replaces DashMap for minimal overhead at <10k entries.
+/// 8 shards eliminate contention without the DashMap dependency tree.
+struct RateLimiter {
+    shards: [std::sync::Mutex<HashMap<IpAddr, (u32, std::time::Instant)>>; RATE_SHARDS],
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn shard_index(ip: &IpAddr) -> usize {
+        let h = match ip {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                (o[0] as usize).wrapping_mul(31) ^ (o[1] as usize).wrapping_mul(17)
+                    ^ (o[2] as usize).wrapping_mul(7) ^ (o[3] as usize)
+            }
+            IpAddr::V6(v6) => {
+                v6.octets().iter().fold(0usize, |acc, &b| acc.wrapping_mul(31) ^ b as usize)
+            }
+        };
+        h & (RATE_SHARDS - 1)
+    }
+
+    fn check(&self, ip: IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+        let mut shard = self.shards[Self::shard_index(&ip)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Hard cap per shard to prevent unbounded growth
+        if shard.len() >= RATE_LIMIT_MAX_ENTRIES / RATE_SHARDS {
+            let stale = shard.iter()
+                .find(|(_, (_, ts))| now.duration_since(*ts) > window)
+                .map(|(k, _)| *k);
+            match stale {
+                Some(key) => { shard.remove(&key); }
+                None => return false,
+            }
+        }
+        let entry = shard.entry(ip).or_insert((0, now));
+        if now.duration_since(entry.1) > window {
+            *entry = (1, now);
+            true
+        } else if entry.0 >= RATE_LIMIT_MAX_REQUESTS {
+            false
+        } else {
+            entry.0 += 1;
+            true
+        }
+    }
+
+    /// Evict stale entries from all shards. Called by hourly cleanup.
+    fn clean_stale(&self) {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+        for shard in &self.shards {
+            let mut map = shard.lock().unwrap_or_else(|e| e.into_inner());
+            map.retain(|_, (_, ts)| now.duration_since(*ts) <= window);
+        }
+    }
 }
 
 pub struct AppState {
@@ -56,11 +135,8 @@ pub struct AppState {
     pub db_pool: crate::db::DbPool,
     pub tls_active: bool,
     pub behind_proxy: bool,
-    /// Sharded concurrent map — no global mutex contention under high concurrency.
-    /// Uses monotonic Instant (not wall clock) to prevent clock-skew manipulation.
-    /// FxHasher: IP keys are not attacker-hashed, so collision resistance is unnecessary;
-    /// ~2-3x faster than SipHash on rate-limit hot paths.
-    rate_limiter: DashMap<IpAddr, (u32, std::time::Instant), rustc_hash::FxBuildHasher>,
+    /// Sharded mutex rate limiter — monotonic Instant prevents clock-skew attacks.
+    rate_limiter: RateLimiter,
     /// In-flight request counter for graceful shutdown drain.
     in_flight: std::sync::atomic::AtomicUsize,
     /// Circuit breaker: epoch second of last DB failure. Circuit open if within cooldown.
@@ -73,32 +149,8 @@ impl AppState {
     }
 
     /// Returns true if the request is within rate limits.
-    /// Uses DashMap (sharded locks) so concurrent requests don't serialize on a global mutex.
-    /// Monotonic Instant prevents clock-skew attacks from resetting windows.
     pub fn check_rate_limit(&self, ip: IpAddr) -> bool {
-        let now = std::time::Instant::now();
-        let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
-        // Hard cap: if full, try to evict one expired entry before rejecting.
-        // Prevents attackers from permanently blocking legitimate IPs by filling the map.
-        if self.rate_limiter.len() >= RATE_LIMIT_MAX_ENTRIES {
-            let stale_key = self.rate_limiter.iter()
-                .find(|entry| now.duration_since(entry.value().1) > window)
-                .map(|entry| *entry.key());
-            match stale_key {
-                Some(key) => { self.rate_limiter.remove(&key); }
-                None => return false,
-            }
-        }
-        let mut entry = self.rate_limiter.entry(ip).or_insert((0, now));
-        if now.duration_since(entry.1) > window {
-            *entry = (1, now);
-            true
-        } else if entry.0 >= RATE_LIMIT_MAX_REQUESTS {
-            false
-        } else {
-            entry.0 += 1;
-            true
-        }
+        self.rate_limiter.check(ip)
     }
 
     /// Record a DB failure timestamp. The first request after the cooldown naturally tests the DB.
@@ -139,35 +191,7 @@ const MAX_BODY_SIZE: usize = 64 * 1024;
 pub async fn run_server(credentials: Credentials) -> Result<()> {
     // --- Startup checks ---
 
-    // Enforce file descriptor limit: raise soft limit toward 65535 if below 4096.
-    // Without enough fds, a connection spike causes "too many open files" crashes.
-    #[cfg(unix)]
-    {
-        let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } == 0 {
-            let current = rlim.rlim_cur;
-            if current < 4096 {
-                let target = rlim.rlim_max.min(65535);
-                if target >= 4096 {
-                    rlim.rlim_cur = target;
-                    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } == 0 {
-                        tracing::info!("Raised RLIMIT_NOFILE soft limit: {current} → {target}");
-                    } else {
-                        tracing::warn!(
-                            "Failed to raise RLIMIT_NOFILE from {current} to {target}"
-                        );
-                    }
-                } else {
-                    anyhow::bail!(
-                        "RLIMIT_NOFILE hard limit is {} (need ≥4096). Raise with: ulimit -n 4096",
-                        rlim.rlim_max
-                    );
-                }
-            }
-        }
-    }
-
-    // Fix 8: Warn if log file is getting large (risk of disk-full on vault writes)
+    // Warn if log file is getting large (risk of disk-full on vault writes)
     if let Ok(log_path) = config::log_path() {
         if let Ok(metadata) = std::fs::metadata(&log_path) {
             let size_mb = metadata.len() / (1024 * 1024);
@@ -207,7 +231,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
     let db_pool = crate::db::open_pool(pool_size)?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], credentials.port));
-    let tls_mode = TlsMode::from_credentials(&credentials);
+    let tls_mode = TlsMode::from_credentials(&credentials)?;
 
     let tls_active = !matches!(tls_mode, TlsMode::None);
 
@@ -220,7 +244,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         db_pool,
         tls_active,
         behind_proxy,
-        rate_limiter: DashMap::with_capacity_and_hasher(256, rustc_hash::FxBuildHasher),
+        rate_limiter: RateLimiter::new(),
         in_flight: std::sync::atomic::AtomicUsize::new(0),
         last_db_failure: std::sync::atomic::AtomicU64::new(0),
     });
@@ -258,7 +282,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         }
     });
 
-    // Background task: clean expired magic links, old deposit nonces hourly
+    // Background task: clean expired magic links, old deposit nonces, stale rate limiter entries hourly
     let cleanup_state = state.clone();
     tokio::spawn(async move {
         loop {
@@ -315,6 +339,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 }
                 let _ = conn.execute_batch("PRAGMA optimize;");
             }).await;
+            // Clean stale rate limiter entries (non-blocking, quick lock per shard)
+            cleanup_state.rate_limiter.clean_stale();
         }
     });
 
@@ -368,13 +394,9 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 .await
                 .context("Server error")?;
         }
-        TlsMode::Auto { .. } | TlsMode::Custom { .. } => {
-            let is_auto = matches!(tls_mode, TlsMode::Auto { .. });
+        TlsMode::Custom { .. } => {
             let rustls_config = crate::tls::resolve_rustls_config(&tls_mode).await?;
-            if is_auto {
-                crate::tls::spawn_renewal_watcher(rustls_config.clone());
-            }
-            // Reload TLS cert on SIGHUP (works for both auto and custom certs)
+            // Reload TLS cert on SIGHUP
             #[cfg(unix)]
             {
                 let sighup_config = rustls_config.clone();
@@ -406,8 +428,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 shutdown_signal().await;
                 shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
             });
-            let mode_label = if is_auto { "acme.sh" } else { "custom cert" };
-            info!("Listening on {} (HTTPS/{}, PID {})", addr, mode_label, std::process::id());
+            info!("Listening on {} (HTTPS, PID {})", addr, std::process::id());
             axum_server::bind_rustls(addr, rustls_config)
                 .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())
@@ -422,7 +443,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         let drain_start = std::time::Instant::now();
         let drain_timeout = std::time::Duration::from_secs(30);
         loop {
-            let remaining = shutdown_state.in_flight.load(Ordering::Relaxed);
+            let remaining = shutdown_state.in_flight.load(Ordering::SeqCst);
             if remaining == 0 {
                 break;
             }

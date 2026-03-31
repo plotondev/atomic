@@ -42,17 +42,12 @@ pub fn create_signed_token(
 }
 
 /// Verify signature and expiry only (no DB access). Returns the payload if valid.
+/// Silent on failure — no logging to prevent timing attacks and information leakage.
 pub fn verify_signature(
     token: &str,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Option<DepositPayload> {
-    match try_verify_signature(token, verifying_key) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            tracing::debug!("Deposit verify failed: {}", e);
-            None
-        }
-    }
+    try_verify_signature(token, verifying_key).ok()
 }
 
 fn try_verify_signature(
@@ -170,51 +165,10 @@ fn generate_nonce() -> String {
     hex::encode(bytes)
 }
 
-// Accepts "10m", "1h", "30s".
-pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
-    let s = s.trim();
-    if s.is_empty() {
-        anyhow::bail!("Empty duration string");
-    }
-
-    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('m') {
-        (n, 60)
-    } else if let Some(n) = s.strip_suffix('h') {
-        (n, 3600)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1)
-    } else {
-        anyhow::bail!("Duration must end with 's' (seconds), 'm' (minutes), or 'h' (hours)");
-    };
-
-    let num: u64 = num_str
-        .parse()
-        .map_err(|_| anyhow::anyhow!("Invalid number in duration: '{num_str}'"))?;
-
-    Ok(Duration::from_secs(
-        num.checked_mul(multiplier)
-            .ok_or_else(|| anyhow::anyhow!("Duration too large"))?,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::signing as s;
-
-    #[test]
-    fn parse_duration_values() {
-        assert_eq!(parse_duration("10m").unwrap(), Duration::from_secs(600));
-        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
-        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn parse_duration_rejects_garbage() {
-        assert!(parse_duration("").is_err());
-        assert!(parse_duration("10x").is_err());
-        assert!(parse_duration("abc").is_err());
-    }
 
     #[test]
     fn signed_token_roundtrip() {
@@ -291,18 +245,6 @@ mod tests {
         // Should be capped at ~24h, not 48h
         assert!(payload.expires_at <= now + 24 * 3600 + 5);
         assert!(payload.expires_at > now + 23 * 3600); // but at least ~23h
-    }
-
-    #[test]
-    fn parse_duration_zero_values() {
-        assert_eq!(parse_duration("0s").unwrap(), Duration::from_secs(0));
-        assert_eq!(parse_duration("0m").unwrap(), Duration::from_secs(0));
-        assert_eq!(parse_duration("0h").unwrap(), Duration::from_secs(0));
-    }
-
-    #[test]
-    fn parse_duration_trims_whitespace() {
-        assert_eq!(parse_duration("  10m  ").unwrap(), Duration::from_secs(600));
     }
 
     fn test_db() -> rusqlite::Connection {
