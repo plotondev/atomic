@@ -208,6 +208,15 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 
 ## Changelog
 
+**fdee3d2** — Harden server: 404-everything, SIGTERM/SIGHUP handling, shutdown WAL checkpoint, ciphertext size limit, SQLite mmap
+- All HTTP error paths return 404 (no 500s) to prevent information leakage
+- `shutdown_signal()` handles SIGTERM (from `atomic stop`) and SIGINT
+- `kill -HUP` triggers immediate TLS cert reload on Unix (zero-delay vs 12h poll)
+- Final WAL checkpoint (TRUNCATE) on shutdown for data integrity
+- Graceful shutdown timeout 10s → 30s for slow-disk WAL merge
+- `decrypt()` rejects ciphertext >16MB before allocation (resource exhaustion defense)
+- SQLite: `wal_autocheckpoint=1000` pages, `mmap_size=64MB` for read throughput
+
 **fcfffe5** — Production hardening: SQLite resilience, fsync durability, WAL checkpointing, zeroize decrypt output
 - SQLite: `busy_timeout=5s`, `journal_size_limit=64MB`, `synchronous=NORMAL` (WAL-safe)
 - Atomic writes: fsync data + parent directory on Unix for crash safety
