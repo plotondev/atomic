@@ -20,7 +20,14 @@ use crate::config;
 use crate::credentials::Credentials;
 use crate::tls::TlsMode;
 
+/// Max restarts within the circuit breaker window before we abort the process.
+const SUPERVISOR_MAX_RESTARTS: u32 = 5;
+/// Circuit breaker window: if SUPERVISOR_MAX_RESTARTS occur within this duration, fail-fast.
+const SUPERVISOR_WINDOW_SECS: u64 = 300; // 5 minutes
+
 /// Spawn a supervised background task that restarts on panic/error with exponential backoff.
+/// Circuit breaker: if 5 restarts occur within 5 minutes, abort the process to prevent
+/// resource exhaustion on unrecoverable errors (e.g., SQLite corruption).
 fn spawn_supervised<F, Fut>(name: &'static str, make_task: F)
 where
     F: Fn() -> Fut + Send + 'static,
@@ -28,13 +35,29 @@ where
 {
     tokio::spawn(async move {
         let mut retries: u32 = 0;
+        let mut window_start = std::time::Instant::now();
+        let mut window_restarts: u32 = 0;
         loop {
             let result = tokio::spawn(make_task()).await;
             match result {
                 Ok(()) => break, // clean exit
                 Err(e) => {
+                    let now = std::time::Instant::now();
+                    // Reset circuit breaker window if enough time has passed
+                    if now.duration_since(window_start).as_secs() > SUPERVISOR_WINDOW_SECS {
+                        window_start = now;
+                        window_restarts = 0;
+                    }
+                    window_restarts += 1;
+                    if window_restarts >= SUPERVISOR_MAX_RESTARTS {
+                        tracing::error!(
+                            "{name} task failed {SUPERVISOR_MAX_RESTARTS} times in {SUPERVISOR_WINDOW_SECS}s — aborting process"
+                        );
+                        std::process::exit(1);
+                    }
+
                     let delay_secs = 5_u64.saturating_mul(1u64 << retries.min(6)); // 5s, 10s, 20s, ..., 320s (capped)
-                    tracing::error!("{name} task panicked: {e}. Restarting in {delay_secs}s...");
+                    tracing::error!("{name} task panicked: {e}. Restarting in {delay_secs}s ({window_restarts}/{SUPERVISOR_MAX_RESTARTS} in window)...");
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     retries = retries.saturating_add(1);
                 }
@@ -76,9 +99,11 @@ impl AppState {
     pub fn check_rate_limit(&self, ip: IpAddr) -> bool {
         let now = chrono::Utc::now().timestamp();
         let mut map = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
-        // Evict stale entries when the map grows too large to prevent memory exhaustion
+        // Always evict stale entries to guarantee bounded memory regardless of attacker volume
+        map.retain(|_, (_, window_start)| now - *window_start <= RATE_LIMIT_WINDOW_SECS);
+        // Hard cap as defense-in-depth against clock skew or other edge cases
         if map.len() >= RATE_LIMIT_MAX_ENTRIES {
-            map.retain(|_, (_, window_start)| now - *window_start <= RATE_LIMIT_WINDOW_SECS);
+            return false;
         }
         let entry = map.entry(ip).or_insert((0, now));
         if now - entry.1 > RATE_LIMIT_WINDOW_SECS {
@@ -138,7 +163,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         rate_limiter: std::sync::Mutex::new(HashMap::with_capacity(256)),
     });
 
-    // Background task: WAL checkpoint every 5 minutes to prevent unbounded WAL growth
+    // Background task: WAL checkpoint every 5 minutes (PASSIVE to avoid blocking writers;
+    // the hourly cleanup task runs TRUNCATE to actually reclaim WAL disk space).
     let wal_state = state.clone();
     spawn_supervised("wal-checkpoint", move || {
         let st = wal_state.clone();
@@ -148,7 +174,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 let db_ref = st.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let conn = db_ref.db.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
                         tracing::warn!("WAL checkpoint failed: {e}");
                     }
                 }).await;
@@ -178,6 +204,10 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                     let log_cutoff = now - 90 * 86400;
                     if let Err(e) = conn.execute("DELETE FROM deposit_log WHERE deposited_at < ?1", [log_cutoff]) {
                         tracing::warn!("Failed to clean old deposit log entries: {e}");
+                    }
+                    // TRUNCATE checkpoint hourly to reclaim WAL disk space
+                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                        tracing::warn!("Hourly WAL TRUNCATE checkpoint failed: {e}");
                     }
                     // Evict stale rate limiter entries
                     let mut map = db_ref.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());

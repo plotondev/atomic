@@ -72,6 +72,15 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Verify process still alive immediately before kill to minimize PID reuse window
+            let probe = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status();
+            if !probe.map(|s| s.success()).unwrap_or(false) {
+                let _ = std::fs::remove_file(&pid_path);
+                anyhow::bail!("PID {pid} no longer exists (stale PID file removed)");
+            }
+
             // Send SIGTERM
             let status = std::process::Command::new("kill")
                 .arg(pid.to_string())
