@@ -208,6 +208,15 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 
 ## Changelog
 
+**88852d8** — OnceLock AppState (kill Box::leak), flock-based stop (kill ps/kill -0 TOCTOU), DbPool shutdown flag, fail-open rate limiter, drop base64 for base64ct (constant-time), remove unsafe panic hook
+- `server.rs`: replace `Box::leak(Box::new(AppState))` with `OnceLock<AppState>` — eliminates intentional memory leak while preserving `&'static` access. State owned by static, not orphaned on heap.
+- `server.rs`: rate limiter uses `try_lock()` instead of `lock()` — fails open on contention (allows request) instead of blocking, eliminating tail latency spikes under load.
+- `main.rs`: rewrite `atomic stop` to use `flock` for process liveness detection — replaces racy `ps`/`kill -0` TOCTOU checks with kernel-enforced exclusive lock test. Eliminates PID reuse attack window.
+- `main.rs`: remove panic hook that performed file I/O (PID cleanup, temp file deletion) — file I/O in panic handlers is async-signal-unsafe (deadlock risk). Kernel releases flock automatically on process exit.
+- `db.rs`: add `AtomicBool` shutdown flag to `DbPool` — `shutdown()` wakes all `Condvar` waiters and rejects new acquisitions, preventing indefinite hangs during SIGTERM.
+- `Cargo.toml`: swap `base64` for `base64ct` — constant-time base64 encoding/decoding prevents timing side-channels during deposit token verification. Removes direct `base64` dependency.
+- Net: −89 lines added/+95 removed (net +6 for shutdown safety), −1 direct dependency (base64 → base64ct), 68 tests passing.
+
 **e61756c** — Box::leak AppState (kill Arc refcount), drop chrono (epoch_secs + Hinnant RFC3339), Box<str> vault secrets, static magic-link JSON response
 - `server.rs`: replace `Arc<AppState>` with `Box::leak` for `&'static AppState` — eliminates atomic refcount increment/decrement on every request handler clone. AppState is process-lifetime singleton, leaking is zero-cost.
 - `server.rs`: remove `MagicLinkResponse` struct — magic link JSON response is now a static string literal (`r#"{"status":"verified"}"#`), removing serde serialization from the hot path.
