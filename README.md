@@ -271,6 +271,14 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Rate limiter eviction split into dedicated 5-minute task (was hourly), bounding DashMap memory under sustained attack
 - Connection pool uses bounded `sync_channel(size)` instead of unbounded `channel()` for explicit capacity enforcement
 
+**756eadb** — Cooperative conn interrupt, prepared statement cache, request timeout, global magic link rate limit
+- `db.rs`: call `interrupt()` before force-closing stale SQLite connections for clean WAL rollback
+- Hot-path DB queries (`deposit`, `magic_link`, `vault`) switched to `prepare_cached()` to eliminate repeated SQL parse overhead
+- 30s global request timeout middleware as defense-in-depth against slow clients or stuck handlers
+- Pool size configurable via `ATOMIC_POOL_SIZE` env var (1–64, default auto-detect)
+- Rate limiter evicts one expired entry inline when DashMap is full instead of blanket-denying new IPs
+- Global per-second rate limit (20/s) on magic link claims prevents distributed brute-force
+
 **5fc281e** — AES-GCM zeroize, dynamic pool sizing, health check WAL monitor
 - Enable `zeroize` feature on `aes-gcm`: AES key schedule is now wiped from memory on cipher drop
 - DB connection pool sized dynamically via `available_parallelism()` (clamped 2..8) instead of hardcoded 4
