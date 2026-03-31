@@ -284,6 +284,14 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Rate limiter evicts one expired entry inline when DashMap is full instead of blanket-denying new IPs
 - Global per-second rate limit (20/s) on magic link claims prevents distributed brute-force
 
+**4bc32f4** — Pool poison detection, DB circuit breaker, RLIMIT_NOFILE enforcement, proactive WAL truncation
+- `PooledConn::drop` checks `is_autocommit()` and rolls back active transactions before returning to pool (prevents poisoned connections)
+- Per-request DB circuit breaker: opens after 5 consecutive failures, returns 503+Retry-After:30 for 30s cool-down
+- Startup enforces RLIMIT_NOFILE ≥4096 via `libc::setrlimit`, raises soft limit toward 65535 (prevents "too many open files" under load)
+- WAL checkpoint task escalates from PASSIVE to TRUNCATE when WAL exceeds 40MB (prevents unbounded WAL growth)
+- Rate limiter `DashMap::retain()` offloaded to `spawn_blocking` to avoid stalling async executor under 100k+ IP entries
+- `X-Frame-Options: DENY` security header added to all responses
+
 **033e801** — Connection max-lifetime recycling, hard heap limit, zero-copy sig decode, safer shutdown
 - Pooled SQLite connections recycled after 30 min to reset allocator fragmentation (new `created_at` tracking)
 - `PRAGMA hard_heap_limit=128MB` caps process-wide SQLite memory to prevent OOM
