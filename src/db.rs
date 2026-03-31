@@ -131,7 +131,7 @@ fn open_connection(db_path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "journal_size_limit", "67108864")?;
     conn.pragma_update(None, "wal_autocheckpoint", "1000")?;
-    conn.pragma_update(None, "mmap_size", "67108864")?;
+    conn.pragma_update(None, "mmap_size", "268435456")?; // 256MB — zero-copy reads for single-tenant
     // Process-wide SQLite memory limit to prevent OOM under sustained load
     let _ = conn.pragma_update(None, "hard_heap_limit", "134217728"); // 128MB
     // Increase prepared statement cache for hot query paths (default is 16)

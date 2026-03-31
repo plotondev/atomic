@@ -9,7 +9,6 @@ use axum::{
 };
 use dashmap::DashMap;
 use serde::Serialize;
-use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -21,77 +20,17 @@ use crate::config;
 use crate::credentials::Credentials;
 use crate::tls::TlsMode;
 
-/// Max restarts within the circuit breaker window before we abort the process.
-const SUPERVISOR_MAX_RESTARTS: u32 = 5;
-/// Circuit breaker window: if SUPERVISOR_MAX_RESTARTS occur within this duration, fail-fast.
-const SUPERVISOR_WINDOW_SECS: u64 = 300; // 5 minutes
-
 /// Timeout for DB operations in HTTP handlers. Must exceed SQLite busy_timeout (4s)
 /// so that SQLite returns BUSY cleanly before the task gets force-cancelled.
 const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Spawn a supervised background task that restarts on panic/error with exponential backoff.
-/// Circuit breaker: if 5 restarts occur within 5 minutes, enter max backoff (320s) instead
-/// of killing the process — process::exit skips destructors, preventing Zeroizing from
-/// wiping vault keys and the final WAL checkpoint from running.
-fn spawn_supervised<F, Fut>(name: &'static str, make_task: F)
-where
-    F: Fn() -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut retries: u32 = 0;
-        let mut window_start = std::time::Instant::now();
-        let mut window_restarts: u32 = 0;
-        let mut circuit_open = false;
-        loop {
-            let result = tokio::spawn(make_task()).await;
-            match result {
-                Ok(()) => break, // clean exit
-                Err(e) => {
-                    let now = std::time::Instant::now();
-                    // Reset circuit breaker window if enough time has passed
-                    if now.duration_since(window_start).as_secs() > SUPERVISOR_WINDOW_SECS {
-                        window_start = now;
-                        window_restarts = 0;
-                        if circuit_open {
-                            tracing::info!("{name}: circuit breaker reset after quiet period");
-                            circuit_open = false;
-                            retries = 0;
-                        }
-                    }
-                    window_restarts += 1;
-                    if window_restarts >= SUPERVISOR_MAX_RESTARTS && !circuit_open {
-                        tracing::error!(
-                            "{name}: circuit breaker OPEN — {SUPERVISOR_MAX_RESTARTS} failures in {SUPERVISOR_WINDOW_SECS}s, entering max backoff"
-                        );
-                        circuit_open = true;
-                    }
-
-                    let delay_secs = if circuit_open {
-                        320 // Max backoff while circuit is open
-                    } else {
-                        5_u64.saturating_mul(1u64 << retries.min(6)) // 5s, 10s, 20s, ..., 320s
-                    };
-                    tracing::error!("{name} task panicked: {e}. Restarting in {delay_secs}s ({window_restarts}/{SUPERVISOR_MAX_RESTARTS} in window)...");
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                    retries = retries.saturating_add(1);
-                }
-            }
-        }
-    });
-}
-
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_MAX_REQUESTS: u32 = 10;
 const RATE_LIMIT_MAX_ENTRIES: usize = 10_000;
-const MAGIC_LINK_GLOBAL_MAX_PER_SEC: u32 = 20;
 const MAX_INPUT_LEN: usize = 256;
 
-/// Consecutive DB failures before the circuit breaker opens.
-const DB_CIRCUIT_THRESHOLD: u32 = 5;
-/// How long (seconds) the circuit stays open before allowing a probe request.
-const DB_CIRCUIT_OPEN_SECS: u64 = 30;
+/// Circuit breaker cool-down: DB operations rejected for this many seconds after last failure.
+const DB_CIRCUIT_COOLDOWN_SECS: u64 = 60;
 
 fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
@@ -100,11 +39,12 @@ fn epoch_secs() -> u64 {
         .as_secs()
 }
 
-/// Reject inputs with non-printable characters or excessive length.
+/// Reject inputs with non-printable or non-ASCII characters.
+/// `bytes().all()` is auto-vectorized on x86_64 (SSE/AVX) — no UTF-8 overhead.
 fn is_valid_input(s: &str) -> bool {
-    !s.is_empty()
+    s.len() > 0
         && s.len() <= MAX_INPUT_LEN
-        && s.bytes().all(|b| b >= 0x20 && b != 0x7F)
+        && s.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
 }
 
 pub struct AppState {
@@ -123,14 +63,8 @@ pub struct AppState {
     rate_limiter: DashMap<IpAddr, (u32, std::time::Instant), rustc_hash::FxBuildHasher>,
     /// In-flight request counter for graceful shutdown drain.
     in_flight: std::sync::atomic::AtomicUsize,
-    /// Global rate limit for magic link claims (epoch second of current window).
-    magic_link_window: std::sync::atomic::AtomicI64,
-    /// Count of magic link claims in the current 1-second window.
-    magic_link_count: std::sync::atomic::AtomicU32,
-    /// Circuit breaker: consecutive DB operation failure count.
-    db_fail_count: std::sync::atomic::AtomicU32,
-    /// Circuit breaker: epoch second when circuit opened (0 = closed).
-    db_circuit_opened_at: std::sync::atomic::AtomicU64,
+    /// Circuit breaker: epoch second of last DB failure. Circuit open if within cooldown.
+    last_db_failure: std::sync::atomic::AtomicU64,
 }
 
 impl AppState {
@@ -167,52 +101,23 @@ impl AppState {
         }
     }
 
-    /// Record a DB operation failure. Opens the circuit after DB_CIRCUIT_THRESHOLD consecutive failures.
-    /// Uses Relaxed for the hot-path counter increment; Release on the state transition
-    /// so that `is_db_circuit_open` (Acquire) sees a consistent fail_count + opened_at pair.
+    /// Record a DB failure timestamp. The first request after the cooldown naturally tests the DB.
     fn record_db_failure(&self) {
-        let count = self.db_fail_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if count >= DB_CIRCUIT_THRESHOLD {
-            let now = epoch_secs();
-            let prev = self.db_circuit_opened_at.load(Ordering::Acquire);
-            if prev == 0 {
-                self.db_circuit_opened_at.store(now, Ordering::Release);
-                tracing::error!("DB circuit breaker OPEN after {count} consecutive failures");
-            }
-        }
+        self.last_db_failure.store(epoch_secs(), Ordering::Relaxed);
     }
 
-    /// Record a successful DB operation. Resets the circuit breaker.
+    /// Record a successful DB operation. Clears the circuit breaker.
     fn record_db_success(&self) {
-        self.db_fail_count.store(0, Ordering::Release);
-        if self.db_circuit_opened_at.load(Ordering::Acquire) != 0 {
-            self.db_circuit_opened_at.store(0, Ordering::Release);
-            tracing::info!("DB circuit breaker closed after successful operation");
+        if self.last_db_failure.load(Ordering::Relaxed) != 0 {
+            self.last_db_failure.store(0, Ordering::Relaxed);
         }
     }
 
-    /// Returns true if the circuit is open (DB operations should be rejected).
+    /// Circuit is open if last failure was within the cooldown window.
+    /// No half-open probe needed: the first request after cooldown naturally tests the DB.
     fn is_db_circuit_open(&self) -> bool {
-        let opened_at = self.db_circuit_opened_at.load(Ordering::Acquire);
-        if opened_at == 0 {
-            return false;
-        }
-        // Allow a probe request after the cool-down period (half-open state)
-        epoch_secs().saturating_sub(opened_at) < DB_CIRCUIT_OPEN_SECS
-    }
-
-    /// Global rate limit for magic link claim attempts (across all IPs).
-    /// Prevents distributed brute-force even if each IP stays under per-IP limits.
-    fn check_magic_link_global_rate(&self) -> bool {
-        let now = chrono::Utc::now().timestamp();
-        let window = self.magic_link_window.load(Ordering::Relaxed);
-        if window != now {
-            self.magic_link_window.store(now, Ordering::Relaxed);
-            self.magic_link_count.store(1, Ordering::Relaxed);
-            return true;
-        }
-        let count = self.magic_link_count.fetch_add(1, Ordering::Relaxed);
-        count < MAGIC_LINK_GLOBAL_MAX_PER_SEC
+        let last = self.last_db_failure.load(Ordering::Relaxed);
+        last != 0 && epoch_secs().saturating_sub(last) < DB_CIRCUIT_COOLDOWN_SECS
     }
 }
 
@@ -317,133 +222,99 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         behind_proxy,
         rate_limiter: DashMap::with_capacity_and_hasher(256, rustc_hash::FxBuildHasher),
         in_flight: std::sync::atomic::AtomicUsize::new(0),
-        magic_link_window: std::sync::atomic::AtomicI64::new(0),
-        magic_link_count: std::sync::atomic::AtomicU32::new(0),
-        db_fail_count: std::sync::atomic::AtomicU32::new(0),
-        db_circuit_opened_at: std::sync::atomic::AtomicU64::new(0),
+        last_db_failure: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Background task: WAL checkpoint every 5 minutes (PASSIVE to avoid blocking writers;
     // the hourly cleanup task runs TRUNCATE to actually reclaim WAL disk space).
     let wal_state = state.clone();
-    spawn_supervised("wal-checkpoint", move || {
-        let st = wal_state.clone();
-        async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                let db_ref = st.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    // Check WAL file size: escalate from PASSIVE to TRUNCATE if >40MB
-                    // to prevent unbounded WAL growth under heavy reader load.
-                    let wal_large = crate::config::atomic_dir()
-                        .map(|d| d.join("atomic.db-wal"))
-                        .ok()
-                        .and_then(|p| std::fs::metadata(&p).ok())
-                        .map(|m| m.len() > 40 * 1024 * 1024)
-                        .unwrap_or(false);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            let db_ref = wal_state.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let wal_large = crate::config::atomic_dir()
+                    .map(|d| d.join("atomic.db-wal"))
+                    .ok()
+                    .and_then(|p| std::fs::metadata(&p).ok())
+                    .map(|m| m.len() > 40 * 1024 * 1024)
+                    .unwrap_or(false);
 
-                    match db_ref.db_pool.get() {
-                        Ok(conn) => {
-                            if wal_large {
-                                tracing::warn!("WAL exceeds 40MB, forcing TRUNCATE checkpoint");
-                                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                                    tracing::warn!("WAL TRUNCATE checkpoint failed: {e}, falling back to RESTART");
-                                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(RESTART);");
-                                }
-                            } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
-                                tracing::warn!("WAL checkpoint failed: {e}");
+                match db_ref.db_pool.get() {
+                    Ok(conn) => {
+                        if wal_large {
+                            tracing::warn!("WAL exceeds 40MB, forcing TRUNCATE checkpoint");
+                            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                                tracing::warn!("WAL TRUNCATE checkpoint failed: {e}, falling back to RESTART");
+                                let _ = conn.execute_batch("PRAGMA wal_checkpoint(RESTART);");
                             }
+                        } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                            tracing::warn!("WAL checkpoint failed: {e}");
                         }
-                        Err(e) => tracing::warn!("WAL checkpoint: pool exhausted: {e}"),
                     }
-                }).await;
-            }
+                    Err(e) => tracing::warn!("WAL checkpoint: pool exhausted: {e}"),
+                }
+            }).await;
         }
     });
 
-    // Background task: clean expired magic links, old deposit nonces, and rate limiter entries
+    // Background task: clean expired magic links, old deposit nonces hourly
     let cleanup_state = state.clone();
-    spawn_supervised("db-cleanup", move || {
-        let st = cleanup_state.clone();
-        async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                let db_ref = st.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let conn = match db_ref.db_pool.get() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::warn!("DB cleanup: pool exhausted: {e}");
-                            return;
-                        }
-                    };
-                    let now = chrono::Utc::now().timestamp();
-                    // Paginated deletes: batch 1000 rows at a time to avoid holding
-                    // the WAL write lock for extended periods under heavy load.
-                    loop {
-                        match conn.execute(
-                            "DELETE FROM magic_links WHERE rowid IN \
-                             (SELECT rowid FROM magic_links WHERE expires_at <= ?1 LIMIT 1000)",
-                            [now],
-                        ) {
-                            Ok(0) => break,
-                            Ok(_) => continue,
-                            Err(e) => { tracing::warn!("Failed to clean expired magic links: {e}"); break; }
-                        }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            let db_ref = cleanup_state.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let conn = match db_ref.db_pool.get() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("DB cleanup: pool exhausted: {e}");
+                        return;
                     }
-                    let cutoff = now - 7 * 86400;
-                    loop {
-                        match conn.execute(
-                            "DELETE FROM used_deposits WHERE rowid IN \
-                             (SELECT rowid FROM used_deposits WHERE used_at < ?1 LIMIT 1000)",
-                            [cutoff],
-                        ) {
-                            Ok(0) => break,
-                            Ok(_) => continue,
-                            Err(e) => { tracing::warn!("Failed to clean old deposit nonces: {e}"); break; }
-                        }
+                };
+                let now = chrono::Utc::now().timestamp();
+                // Paginated deletes: batch 1000 rows at a time to avoid holding
+                // the WAL write lock for extended periods under heavy load.
+                loop {
+                    match conn.execute(
+                        "DELETE FROM magic_links WHERE rowid IN \
+                         (SELECT rowid FROM magic_links WHERE expires_at <= ?1 LIMIT 1000)",
+                        [now],
+                    ) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(e) => { tracing::warn!("Failed to clean expired magic links: {e}"); break; }
                     }
-                    // Purge deposit log entries older than 90 days to prevent unbounded disk growth
-                    let log_cutoff = now - 90 * 86400;
-                    loop {
-                        match conn.execute(
-                            "DELETE FROM deposit_log WHERE rowid IN \
-                             (SELECT rowid FROM deposit_log WHERE deposited_at < ?1 LIMIT 1000)",
-                            [log_cutoff],
-                        ) {
-                            Ok(0) => break,
-                            Ok(_) => continue,
-                            Err(e) => { tracing::warn!("Failed to clean old deposit log entries: {e}"); break; }
-                        }
+                }
+                let cutoff = now - 7 * 86400;
+                loop {
+                    match conn.execute(
+                        "DELETE FROM used_deposits WHERE rowid IN \
+                         (SELECT rowid FROM used_deposits WHERE used_at < ?1 LIMIT 1000)",
+                        [cutoff],
+                    ) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(e) => { tracing::warn!("Failed to clean old deposit nonces: {e}"); break; }
                     }
-                    // TRUNCATE checkpoint hourly to reclaim WAL disk space
-                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                        tracing::warn!("Hourly WAL TRUNCATE checkpoint failed: {e}");
+                }
+                let log_cutoff = now - 90 * 86400;
+                loop {
+                    match conn.execute(
+                        "DELETE FROM deposit_log WHERE rowid IN \
+                         (SELECT rowid FROM deposit_log WHERE deposited_at < ?1 LIMIT 1000)",
+                        [log_cutoff],
+                    ) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(e) => { tracing::warn!("Failed to clean old deposit log entries: {e}"); break; }
                     }
-                    // Let SQLite update its query planner statistics
-                    let _ = conn.execute_batch("PRAGMA optimize;");
-                }).await;
-            }
-        }
-    });
-
-    // Background task: evict stale rate limiter entries every 5 minutes.
-    // More aggressive than hourly to bound DashMap memory under sustained attack.
-    let rl_state = state.clone();
-    spawn_supervised("rate-limiter-evict", move || {
-        let st = rl_state.clone();
-        async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                // Offload O(n) DashMap scan to the blocking pool to avoid stalling
-                // the async executor under 100k+ entries.
-                let st2 = st.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let cutoff = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
-                    let now = std::time::Instant::now();
-                    st2.rate_limiter.retain(|_, (_, window_start)| now.duration_since(*window_start) <= cutoff);
-                }).await;
-            }
+                }
+                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                    tracing::warn!("Hourly WAL TRUNCATE checkpoint failed: {e}");
+                }
+                let _ = conn.execute_batch("PRAGMA optimize;");
+            }).await;
         }
     });
 
@@ -717,12 +588,10 @@ async fn handle_magic_link(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(code): Path<String>,
 ) -> Response {
-    // Per-IP rate limiting to prevent brute-force of magic link codes
+    // Per-IP rate limiting to prevent brute-force of magic link codes.
+    // For a single-tenant agent, per-IP is sufficient — distributed brute-force
+    // across thousands of IPs is not the threat model.
     if !state.check_rate_limit(addr.ip()) {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    }
-    // Global rate limit: cap total claim attempts across all IPs
-    if !state.check_magic_link_global_rate() {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 

@@ -204,109 +204,34 @@ fn acme_sh_path() -> Result<std::path::PathBuf> {
     anyhow::bail!("acme.sh not found")
 }
 
-// acme.sh sets up its own cron job for renewal. We watch the TLS directory for
-// filesystem events (kqueue/inotify) to pick up renewals immediately, with a
-// 12-hour polling fallback for network filesystems where events may not fire.
+// acme.sh sets up its own cron job for renewal. Poll every 6 hours to pick up
+// renewed certs. SIGHUP provides immediate reload when needed.
+// No filesystem watcher (notify crate removed) — a cert changes every 60 days,
+// so polling + SIGHUP covers it with zero extra threads or OS handles.
 pub fn spawn_renewal_watcher(rustls_config: RustlsConfig) {
     tokio::spawn(async move {
-        let tls_dir = match config::tls_dir() {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("Cannot resolve TLS directory: {e}, falling back to polling");
-                poll_renewal(rustls_config).await;
-                return;
-            }
-        };
+        let check_interval = std::time::Duration::from_secs(6 * 3600);
+        loop {
+            tokio::time::sleep(check_interval).await;
 
-        // Try filesystem watcher first; fall back to polling on failure
-        match watch_cert_files(tls_dir.clone(), rustls_config.clone()).await {
-            Ok(()) => {}
-            Err(e) => {
-                warn!("Filesystem watcher failed: {e}, falling back to 12h polling");
-                poll_renewal(rustls_config).await;
+            let tls_dir = match config::tls_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("Cert reload check failed: {e}");
+                    continue;
+                }
+            };
+
+            let cert_path = tls_dir.join("fullchain.pem");
+            let key_path = tls_dir.join("key.pem");
+
+            match rustls_config
+                .reload_from_pem_file(&cert_path, &key_path)
+                .await
+            {
+                Ok(()) => info!("TLS cert reloaded (6h poll)"),
+                Err(e) => warn!("TLS cert reload failed: {e}"),
             }
         }
     });
-}
-
-/// Watch the TLS directory for cert file changes using OS filesystem events.
-/// Debounces events by 2 seconds to avoid reading partial writes from acme.sh.
-async fn watch_cert_files(
-    tls_dir: std::path::PathBuf,
-    rustls_config: RustlsConfig,
-) -> Result<()> {
-    use notify::{Config, RecursiveMode, Watcher};
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
-
-    let mut watcher = notify::RecommendedWatcher::new(
-        move |res: std::result::Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res {
-                if matches!(
-                    event.kind,
-                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
-                ) {
-                    let _ = tx.try_send(());
-                }
-            }
-        },
-        Config::default(),
-    )
-    .context("Failed to create filesystem watcher")?;
-
-    watcher
-        .watch(&tls_dir, RecursiveMode::NonRecursive)
-        .context("Failed to watch TLS directory")?;
-
-    info!("Watching {} for TLS cert changes", tls_dir.display());
-
-    loop {
-        // Wait for first filesystem event
-        rx.recv().await;
-        // Debounce: drain pending events for 2 seconds to avoid reading partial writes
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
-                Ok(Some(())) => continue,
-                _ => break,
-            }
-        }
-
-        let cert_path = tls_dir.join("fullchain.pem");
-        let key_path = tls_dir.join("key.pem");
-
-        match rustls_config
-            .reload_from_pem_file(&cert_path, &key_path)
-            .await
-        {
-            Ok(()) => info!("TLS cert reloaded (filesystem change detected)"),
-            Err(e) => warn!("TLS cert reload failed: {e}"),
-        }
-    }
-}
-
-/// Fallback: poll every 12 hours for cert changes (for network filesystems).
-async fn poll_renewal(rustls_config: RustlsConfig) {
-    let check_interval = std::time::Duration::from_secs(12 * 3600);
-    loop {
-        tokio::time::sleep(check_interval).await;
-
-        let tls_dir = match config::tls_dir() {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("Cert reload check failed: {e}");
-                continue;
-            }
-        };
-
-        let cert_path = tls_dir.join("fullchain.pem");
-        let key_path = tls_dir.join("key.pem");
-
-        match rustls_config
-            .reload_from_pem_file(&cert_path, &key_path)
-            .await
-        {
-            Ok(()) => info!("TLS cert reloaded"),
-            Err(e) => warn!("TLS cert reload failed: {e}"),
-        }
-    }
 }

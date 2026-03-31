@@ -73,7 +73,6 @@ tikv-jemalloc-ctl = { version = "0.6", optional = true }
 libc = "0.2"
 subtle = "2"
 rustc-hash = "2"
-notify = "7"
 
 [profile.release]
 opt-level = 3
