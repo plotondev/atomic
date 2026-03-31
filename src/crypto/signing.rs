@@ -30,11 +30,13 @@ pub fn decode_public_key(encoded: &str) -> Result<VerifyingKey, CryptoError> {
     let b64 = encoded
         .strip_prefix("ed25519:")
         .ok_or(CryptoError::InvalidKey)?;
-    let bytes = Base64::decode_vec(b64).map_err(|_| CryptoError::InvalidKey)?;
-    let key_bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| CryptoError::InvalidKey)?;
-    VerifyingKey::from_bytes(&key_bytes).map_err(|_| CryptoError::InvalidKey)
+    // Stack-allocated decode: no heap allocation for 32-byte key.
+    let mut buf = [0u8; 32];
+    let decoded = Base64::decode(b64, &mut buf).map_err(|_| CryptoError::InvalidKey)?;
+    if decoded.len() != 32 {
+        return Err(CryptoError::InvalidKey);
+    }
+    VerifyingKey::from_bytes(&buf).map_err(|_| CryptoError::InvalidKey)
 }
 
 pub fn encode_private_key(signing_key: &SigningKey) -> String {
@@ -43,12 +45,12 @@ pub fn encode_private_key(signing_key: &SigningKey) -> String {
 }
 
 pub fn decode_private_key(encoded: &str) -> Result<SigningKey, CryptoError> {
-    let bytes = Zeroizing::new(Base64::decode_vec(encoded).map_err(|_| CryptoError::InvalidKey)?);
-    if bytes.len() != 32 {
+    // Stack-allocated decode directly into Zeroizing — no intermediate Vec.
+    let mut key_bytes = Zeroizing::new([0u8; 32]);
+    let decoded = Base64::decode(encoded, key_bytes.as_mut()).map_err(|_| CryptoError::InvalidKey)?;
+    if decoded.len() != 32 {
         return Err(CryptoError::InvalidKey);
     }
-    let mut key_bytes = Zeroizing::new([0u8; 32]);
-    key_bytes.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&key_bytes))
 }
 
@@ -58,11 +60,13 @@ pub fn encode_signature(signature: &Signature) -> String {
 
 #[allow(dead_code)]
 pub fn decode_signature(encoded: &str) -> Result<Signature, CryptoError> {
-    let bytes = Base64::decode_vec(encoded).map_err(|_| CryptoError::InvalidSignature)?;
-    let sig_bytes: [u8; 64] = bytes
-        .try_into()
-        .map_err(|_| CryptoError::InvalidSignature)?;
-    Ok(Signature::from_bytes(&sig_bytes))
+    // Stack-allocated decode: no heap allocation for 64-byte signature.
+    let mut buf = [0u8; 64];
+    let decoded = Base64::decode(encoded, &mut buf).map_err(|_| CryptoError::InvalidSignature)?;
+    if decoded.len() != 64 {
+        return Err(CryptoError::InvalidSignature);
+    }
+    Ok(Signature::from_bytes(&buf))
 }
 
 #[cfg(test)]

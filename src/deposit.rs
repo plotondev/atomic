@@ -67,9 +67,8 @@ fn try_verify_signature(
     }
     let sig = ed25519_dalek::Signature::from_bytes(&sig_buf);
 
-    use ed25519_dalek::Verifier;
     verifying_key
-        .verify(payload_b64.as_bytes(), &sig)
+        .verify_strict(payload_b64.as_bytes(), &sig)
         .map_err(|e| anyhow::anyhow!("Signature invalid: {e}"))?;
 
     // Stack-allocated buffer for payload decoding (zero heap allocation).

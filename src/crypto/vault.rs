@@ -1,5 +1,5 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, AeadInPlace, KeyInit},
     Aes256Gcm, Nonce,
 };
 use hkdf::Hkdf;
@@ -31,14 +31,16 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError>
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+    // Single allocation, exact size: nonce(12) + ciphertext(len) + tag(16).
+    // encrypt_in_place_detached avoids the intermediate Vec that Aead::encrypt allocates.
+    let mut out = Vec::with_capacity(NONCE_SIZE + plaintext.len() + 16);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(plaintext);
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, b"", &mut out[NONCE_SIZE..])
         .map_err(|_| CryptoError::EncryptionFailed)?;
-
-    let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
-    result.extend_from_slice(&ciphertext);
-    Ok(result)
+    out.extend_from_slice(&tag);
+    Ok(out)
 }
 
 // Expects 12-byte nonce prepended to ciphertext (same format encrypt() produces).

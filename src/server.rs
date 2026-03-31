@@ -51,7 +51,7 @@ const ASCII_OK: [bool; 256] = {
 
 /// Reject inputs with non-printable or non-ASCII characters.
 fn is_valid_input(s: &str) -> bool {
-    s.len() > 0
+    !s.is_empty()
         && s.len() <= MAX_INPUT_LEN
         && s.bytes().all(|b| ASCII_OK[b as usize])
 }
