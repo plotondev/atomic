@@ -208,6 +208,16 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 
 ## Changelog
 
+**ae91eaf** — Remove notify crate, kill spawn_supervised, single-atomic circuit breaker, drop global magic link rate limit, branchless input validation, 256MB mmap
+- Remove `notify` crate: cert renewal watcher replaced with 6-hour polling + SIGHUP for immediate reload (zero extra threads for a cert that changes every 60 days)
+- Remove `spawn_supervised` restart machinery: background tasks use plain `tokio::spawn` — single-tenant agents should surface panics, not mask them with infinite retries
+- Simplify DB circuit breaker: single `AtomicU64` (last failure timestamp) replaces fail counter + opened_at pair. Circuit open = within 60s of last failure
+- Remove global magic link rate limit (`magic_link_window`, `magic_link_count` atomics): per-IP is sufficient for single-tenant, eliminates cross-core cache line bouncing
+- Remove background rate limiter eviction task: lazy eviction on DashMap overflow is sufficient
+- Input validation tightened: `is_ascii_graphic() || b == b' '` rejects non-ASCII bytes (0x80+) that previously slipped through
+- SQLite `mmap_size` increased from 64MB to 256MB for zero-copy reads on single-tenant data
+- Net result: −358 lines, 1 fewer crate, 2 fewer spawned tasks, 3 fewer atomics in AppState
+
 **e3eb87e** — Hard conn lifetime, WAL checkpoint timeout, vault label validation, jemalloc default
 - `PooledConn::drop` force-closes connections held >60s instead of returning to pool (prevents leaks from panicked threads or stuck queries)
 - Final WAL checkpoint wrapped in 5s `tokio::time::timeout` to prevent indefinite hang on shutdown if DB is stuck
