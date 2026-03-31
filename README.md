@@ -284,6 +284,15 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Rate limiter evicts one expired entry inline when DashMap is full instead of blanket-denying new IPs
 - Global per-second rate limit (20/s) on magic link claims prevents distributed brute-force
 
+**033e801** — Connection max-lifetime recycling, hard heap limit, zero-copy sig decode, safer shutdown
+- Pooled SQLite connections recycled after 30 min to reset allocator fragmentation (new `created_at` tracking)
+- `PRAGMA hard_heap_limit=128MB` caps process-wide SQLite memory to prevent OOM
+- Prepared statement cache capacity increased to 100 (from default 16)
+- Shutdown WAL checkpoint uses RESTART with PASSIVE fallback instead of TRUNCATE (avoids indefinite blocking)
+- Health endpoint checks disk space (>100MB free via `fs2::available_space`) to prevent disk-full corruption
+- Ed25519 signature base64 decode uses stack-allocated `[u8; 64]` instead of heap `Vec` (zero-alloc hot path)
+- Panic hook cleans orphaned `.tmp.*` files from `write_secure` atomic write pattern
+
 **5fc281e** — AES-GCM zeroize, dynamic pool sizing, health check WAL monitor
 - Enable `zeroize` feature on `aes-gcm`: AES key schedule is now wiped from memory on cipher drop
 - DB connection pool sized dynamically via `available_parallelism()` (clamped 2..8) instead of hardcoded 4
