@@ -72,10 +72,8 @@ pub fn claim_with_conn(code: &str, conn: &rusqlite::Connection) -> Option<String
     let code_hash = hash_code(code);
 
     let deleted = conn
-        .execute(
-            "DELETE FROM magic_links WHERE code_hash = ?1 AND expires_at > ?2",
-            rusqlite::params![code_hash, now],
-        )
+        .prepare_cached("DELETE FROM magic_links WHERE code_hash = ?1 AND expires_at > ?2")
+        .and_then(|mut stmt| stmt.execute(rusqlite::params![code_hash, now]))
         .ok()?;
 
     if deleted > 0 {

@@ -84,6 +84,7 @@ where
 const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_MAX_REQUESTS: u32 = 10;
 const RATE_LIMIT_MAX_ENTRIES: usize = 10_000;
+const MAGIC_LINK_GLOBAL_MAX_PER_SEC: u32 = 20;
 const MAX_INPUT_LEN: usize = 256;
 
 /// Reject inputs with non-printable characters or excessive length.
@@ -105,6 +106,10 @@ pub struct AppState {
     /// Sharded concurrent map — no global mutex contention under high concurrency.
     /// Uses monotonic Instant (not wall clock) to prevent clock-skew manipulation.
     rate_limiter: DashMap<IpAddr, (u32, std::time::Instant)>,
+    /// Global rate limit for magic link claims (epoch second of current window).
+    magic_link_window: std::sync::atomic::AtomicI64,
+    /// Count of magic link claims in the current 1-second window.
+    magic_link_count: std::sync::atomic::AtomicU32,
 }
 
 impl AppState {
@@ -118,9 +123,16 @@ impl AppState {
     pub fn check_rate_limit(&self, ip: IpAddr) -> bool {
         let now = std::time::Instant::now();
         let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
-        // Hard cap as defense-in-depth (approximate len is fine for rate limiting)
+        // Hard cap: if full, try to evict one expired entry before rejecting.
+        // Prevents attackers from permanently blocking legitimate IPs by filling the map.
         if self.rate_limiter.len() >= RATE_LIMIT_MAX_ENTRIES {
-            return false;
+            let stale_key = self.rate_limiter.iter()
+                .find(|entry| now.duration_since(entry.value().1) > window)
+                .map(|entry| *entry.key());
+            match stale_key {
+                Some(key) => { self.rate_limiter.remove(&key); }
+                None => return false,
+            }
         }
         let mut entry = self.rate_limiter.entry(ip).or_insert((0, now));
         if now.duration_since(entry.1) > window {
@@ -132,6 +144,20 @@ impl AppState {
             entry.0 += 1;
             true
         }
+    }
+
+    /// Global rate limit for magic link claim attempts (across all IPs).
+    /// Prevents distributed brute-force even if each IP stays under per-IP limits.
+    fn check_magic_link_global_rate(&self) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let window = self.magic_link_window.load(std::sync::atomic::Ordering::Relaxed);
+        if window != now {
+            self.magic_link_window.store(now, std::sync::atomic::Ordering::Relaxed);
+            self.magic_link_count.store(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        let count = self.magic_link_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        count < MAGIC_LINK_GLOBAL_MAX_PER_SEC
     }
 }
 
@@ -198,10 +224,16 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
     sk_bytes.iter_mut().for_each(|b| *b = 0); // belt-and-suspenders
     drop(sk_bytes);
 
-    // Size pool to available parallelism (capped 2..8) — WAL mode allows concurrent readers
-    let pool_size = std::thread::available_parallelism()
-        .map(|n| n.get().clamp(2, 8))
-        .unwrap_or(4);
+    // Pool size: env override or auto-detect from available parallelism (capped 2..8)
+    let pool_size = std::env::var("ATOMIC_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| (1..=64).contains(&n))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 8))
+                .unwrap_or(4)
+        });
     let db_pool = crate::db::open_pool(pool_size)?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], credentials.port));
@@ -219,6 +251,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         tls_active,
         behind_proxy,
         rate_limiter: DashMap::with_capacity(256),
+        magic_link_window: std::sync::atomic::AtomicI64::new(0),
+        magic_link_count: std::sync::atomic::AtomicU32::new(0),
     });
 
     // Background task: WAL checkpoint every 5 minutes (PASSIVE to avoid blocking writers;
@@ -319,6 +353,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .route("/m/{code}", get(handle_magic_link))
         .route("/_/health", get(handle_health))
         .fallback(handle_404)
+        .layer(middleware::from_fn(request_timeout))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -536,6 +571,10 @@ async fn handle_magic_link(
     if !state.check_rate_limit(addr.ip()) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
+    // Global rate limit: cap total claim attempts across all IPs
+    if !state.check_magic_link_global_rate() {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
 
     // Reject obviously short codes or codes with non-printable chars before touching the DB
     if code.len() < 20 || !is_valid_input(&code) {
@@ -617,6 +656,17 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
 
 async fn handle_404() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+/// Global request timeout (30s) — defense-in-depth against slow clients or stuck handlers.
+async fn request_timeout(
+    req: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(std::time::Duration::from_secs(30), next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
 }
 
 async fn security_headers(

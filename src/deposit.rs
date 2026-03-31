@@ -89,8 +89,9 @@ pub fn claim_nonce_with_conn(
     conn: &rusqlite::Connection,
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let inserted = conn.execute(
+    let inserted = conn.prepare_cached(
         "INSERT OR IGNORE INTO used_deposits (nonce, label, used_at) VALUES (?1, ?2, ?3)",
+    )?.execute(
         rusqlite::params![payload.nonce, payload.label, now],
     )?;
 
@@ -109,8 +110,9 @@ pub fn log_deposit(
     user_agent: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO deposit_log (label, source_ip, user_agent, deposited_at) VALUES (?1, ?2, ?3, ?4)",
+    )?.execute(
         rusqlite::params![label, source_ip, user_agent, now],
     )?;
     Ok(())

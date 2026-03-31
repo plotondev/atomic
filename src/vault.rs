@@ -5,11 +5,11 @@ use crate::db;
 
 pub fn vault_set_with_conn(conn: &rusqlite::Connection, label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
     let encrypted = crypto_vault::encrypt(vault_key, value.as_bytes())?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT OR REPLACE INTO vault_secrets (label, value) VALUES (?1, ?2)",
+    )?.execute(
         rusqlite::params![label, encrypted],
-    )
-    .context("Failed to store secret")?;
+    ).context("Failed to store secret")?;
     Ok(())
 }
 
