@@ -78,20 +78,6 @@ $ atomic deposits
 $ atomic deposits --label stripe_key
 ```
 
-## Magic links
-
-Domain verification, like DNS TXT records but over HTTP. A service gives the agent a code, the agent hosts it, the service checks.
-
-```bash
-$ atomic magic-link host VERIFY_ABC123 --expires 5m
-https://fin.acme.com/m/VERIFY_ABC123
-
-$ curl https://fin.acme.com/m/VERIFY_ABC123
-{"status":"verified","code":"VERIFY_ABC123"}
-```
-
-One-time use, gone after the first GET, expires in minutes.
-
 ## Request signing
 
 ```bash
@@ -118,7 +104,7 @@ Agents don't need that. An agent with a keypair can prove itself on every reques
 |                  | Human (JWT)                          | Agent (Atomic)                              |
 |------------------|--------------------------------------|---------------------------------------------|
 | **Identity**     | email + password                     | domain (`fin.acme.com`)                     |
-| **Signup**       | create account, get credentials      | sign request + magic link for domain proof  |
+| **Signup**       | create account, get credentials      | sign request, service verifies agent.json   |
 | **Proof**        | service issues a JWT                 | agent signs every request with private key  |
 | **Each request** | send JWT, service checks it          | send signature, service checks agent.json   |
 | **Expiry**       | token expires, agent re-auths        | no token -- signatures are stateless        |
@@ -128,7 +114,7 @@ Agents don't need that. An agent with a keypair can prove itself on every reques
 
 The practical difference: the agent has nothing to manage. No token storage, no refresh logic. The private key stays on the box and never gets sent over the wire.
 
-A service that wants extra assurance can layer a magic link challenge on top of the signature check at signup -- verify the sig, then confirm domain control, then create an internal account for `fin.acme.com`. After that, subsequent requests are just signature checks against a cached public key.
+A service that wants extra assurance can verify domain control via DNS TXT records on top of the signature check at signup. After that, subsequent requests are just signature checks against a cached public key.
 
 Performance-wise, JWT verification is a single HMAC check while Ed25519 verify costs more. But "more" here means microseconds, and the public key only changes on rotation so it caches well. It's not where your latency lives.
 
@@ -145,9 +131,6 @@ atomic verify <domain>                             Check another agent
 
 atomic deposit-url --label <name> --expires <t>    Create deposit URL
 atomic deposits [--label <name>]                   Deposit audit log
-
-atomic magic-link host <code> --expires <t>        Host a verification code
-atomic magic-link list                             Show active codes
 
 atomic vault set <label> <value>                   Store a secret
 atomic vault get <label>                           Read a secret
@@ -179,7 +162,7 @@ HSTS is set when TLS is active.
 
 Private key stored at 600 permissions, never leaves the box. Vault uses AES-256-GCM with a key derived from the private key via HKDF -- separate from the signing key.
 
-Deposit tokens are Ed25519-signed with a nonce and a 24h max TTL. Every failure returns 404 regardless of the reason, so you can't probe for valid tokens. Body size is capped at 1MB.
+Deposit tokens are Ed25519-signed with a nonce and a 24h max TTL. Every failure returns 404 regardless of the reason, so you can't probe for valid tokens. Body size is capped at 64KB.
 
 All responses get `nosniff`, `no-store`, and `no-referrer` headers. HSTS (2-year max-age) when TLS is on. SQL is parameterized everywhere (SQLite in WAL mode).
 
@@ -189,7 +172,7 @@ All responses get `nosniff`, `no-store`, and `no-referrer` headers. HSTS (2-year
 ~/.atomic/
   credentials       domain + keypair (600 perms)
   agent.json        public identity document
-  atomic.db         SQLite (vault, deposits, magic links)
+  atomic.db         SQLite (vault, deposits)
   atomic.pid        server PID
   atomic.log        server logs
   tls/              certificates
@@ -201,12 +184,26 @@ All responses get `nosniff`, `no-store`, and `no-referrer` headers. HSTS (2-year
 git clone https://github.com/ploton/atomic.git
 cd atomic
 cargo build --release    # ~4MB binary
-cargo test               # 68 tests
+cargo test               # 61 tests
 ```
 
 Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`.
 
 ## Changelog
+
+**3d768ca** — Kill magic_link module, CryptoError replaces anyhow in crypto paths, VecDeque pool, drop background tasks
+- `magic_link.rs`: deleted entirely (~175 lines). Magic link domain verification removed — DNS TXT records are sufficient for domain-as-identity. Drops `subtle` dependency, removes DB table, server route, CLI command, hourly cleanup logic.
+- `crypto/mod.rs`: new `CryptoError` enum (zero-allocation, opaque error messages) replaces `anyhow::Result` in all crypto functions. Prevents information leakage via error strings; eliminates heap allocation in crypto paths.
+- `crypto/signing.rs`: `decode_public_key`, `decode_private_key`, `decode_signature` return `Result<T, CryptoError>` instead of `anyhow::Result`.
+- `crypto/vault.rs`: `derive_vault_key`, `encrypt`, `decrypt` return `Result<T, CryptoError>`. Merged size validation into single guard (`< NONCE_SIZE || > MAX_CIPHERTEXT_SIZE`).
+- `db.rs`: `Mutex<Vec<Connection>>` → `Mutex<VecDeque<Connection>>` for O(1) push/pop. Removed 30-minute connection recycling (`CONN_MAX_LIFETIME`, `created_at` tracking, `db_path` field) — SQLite handles connection health via `busy_timeout`.
+- `db.rs`: migration now drops legacy `magic_links` table if present.
+- `server.rs`: removed manual zeroize loop (redundant with `Zeroizing<[u8; 32]>`). Removed SIGHUP TLS cert reload handler (restart on cert change is sufficient). Removed 5-minute WAL checkpoint task (wal_autocheckpoint=1000 handles this). Removed `RateLimiter` struct and all rate limiting (dead code after magic_link removal). Circuit breaker now returns uniform 404 instead of 503+retry-after (prevents internal state leakage).
+- `deposit.rs`: payload base64 decoding uses stack-allocated `[u8; 768]` buffer instead of heap `Vec` (zero heap allocation per deposit request).
+- `config.rs`: removed dead `tls_dir()` function (only used by deleted SIGHUP handler).
+- `cli.rs`: removed `MagicLink` command and `MagicLinkCommand` enum.
+- `Cargo.toml`: removed `subtle` dependency.
+- Net: −516 lines / +69 lines (−447 net), −1 dependency, 61 tests passing.
 
 **88852d8** — OnceLock AppState (kill Box::leak), flock-based stop (kill ps/kill -0 TOCTOU), DbPool shutdown flag, fail-open rate limiter, drop base64 for base64ct (constant-time), remove unsafe panic hook
 - `server.rs`: replace `Box::leak(Box::new(AppState))` with `OnceLock<AppState>` — eliminates intentional memory leak while preserving `&'static` access. State owned by static, not orphaned on heap.
@@ -360,9 +357,8 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 
 - [x] Identity (agent.json + Ed25519)
 - [x] Deposit box (signed URLs, encrypted vault, audit log)
-- [x] Magic links (domain verification)
 - [x] Request signing
-- [x] TLS (BYO cert + SIGHUP reload)
+- [x] TLS (BYO cert)
 - [ ] NS delegation + hosted subdomains
 - [ ] Agent email
 - [ ] Capability declarations
