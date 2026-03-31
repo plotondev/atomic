@@ -77,6 +77,8 @@ impl Credentials {
         // in the serialized JSON is zeroed on drop, not left in freed heap memory.
         let mut buf = zeroize::Zeroizing::new(Vec::new());
         serde_json::to_writer_pretty(&mut *buf, self).context("Failed to serialize credentials")?;
+        // Eliminate capacity slack so Zeroizing wipes all bytes containing key material.
+        buf.shrink_to_fit();
         crate::config::write_secure(path, &buf)
     }
 

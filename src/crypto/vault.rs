@@ -44,8 +44,9 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError>
 }
 
 // Expects 12-byte nonce prepended to ciphertext (same format encrypt() produces).
-// Returns Zeroizing<Vec<u8>> so plaintext is wiped from memory on drop.
-pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+// Returns Zeroizing<Box<[u8]>> — into_boxed_slice() guarantees capacity == len,
+// so Zeroizing wipes the entire allocation with no unzeroed slack bytes.
+pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Zeroizing<Box<[u8]>>, CryptoError> {
     if data.len() < NONCE_SIZE || data.len() > MAX_CIPHERTEXT_SIZE {
         return Err(CryptoError::InvalidCiphertext);
     }
@@ -59,7 +60,7 @@ pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Zeroizing<Vec<u8>>, Crypto
         .decrypt(nonce, ciphertext)
         .map_err(|_| CryptoError::InvalidCiphertext)?;
 
-    Ok(Zeroizing::new(plaintext))
+    Ok(Zeroizing::new(plaintext.into_boxed_slice()))
 }
 
 #[cfg(test)]
@@ -72,7 +73,7 @@ mod tests {
         let plaintext = b"secret data here";
         let encrypted = encrypt(&key, plaintext).unwrap();
         let decrypted = decrypt(&key, &encrypted).unwrap();
-        assert_eq!(plaintext.as_slice(), &*decrypted);
+        assert_eq!(plaintext.as_slice(), &**decrypted);
     }
 
     #[test]

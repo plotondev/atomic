@@ -1,21 +1,26 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config;
 
+/// Recycle connections after 1 hour to prevent RSS growth from SQLite's
+/// accumulated prepared-statement caches, schema caches, and WAL index pages.
+const MAX_CONN_LIFETIME: Duration = Duration::from_secs(3600);
+
 /// Zero-dependency connection pool for SQLite.
 /// Uses Mutex<VecDeque> + Condvar — O(1) push/pop for small pool sizes (2-8).
 /// WAL mode allows concurrent readers; the pool prevents serialization
 /// behind a single Mutex<Connection>.
 pub struct DbPool {
-    conns: Mutex<VecDeque<Connection>>,
+    conns: Mutex<VecDeque<(Connection, Instant)>>,
     available: Condvar,
     shutdown: AtomicBool,
+    db_path: PathBuf,
 }
 
 /// RAII guard that returns the connection to the pool on drop.
@@ -23,6 +28,7 @@ pub struct DbPool {
 pub struct PooledConn<'a> {
     pool: &'a DbPool,
     conn: Option<Connection>,
+    created_at: Instant,
     acquired_at: Instant,
 }
 
@@ -48,6 +54,15 @@ impl Drop for PooledConn<'_> {
             if held > Duration::from_secs(30) {
                 tracing::warn!("SQLite connection held for {:?}, possible leak", held);
             }
+            // Recycle expired connections: drop instead of returning to pool.
+            // The next get() will create a fresh replacement, releasing SQLite's
+            // accumulated caches (prepared statements, schema, WAL index pages).
+            if self.created_at.elapsed() > MAX_CONN_LIFETIME {
+                tracing::debug!("Recycling expired SQLite connection (age {:?})", self.created_at.elapsed());
+                // Notify so get() wakes up and creates a replacement.
+                self.pool.available.notify_one();
+                return;
+            }
             // Poison detection: if a transaction is still active (e.g., handler panicked
             // mid-write), roll it back before returning to the pool. Returning a dirty
             // connection could corrupt subsequent operations on that pooled handle.
@@ -57,9 +72,10 @@ impl Drop for PooledConn<'_> {
             }
             // Panic-safe pool return: catch any panic during mutex lock to prevent
             // double-panic abort (which would skip remaining destructors and Zeroizing).
+            let created_at = self.created_at;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut conns = self.pool.conns.lock().unwrap_or_else(|e| e.into_inner());
-                conns.push_back(c);
+                conns.push_back((c, created_at));
                 self.pool.available.notify_one();
             }));
             if result.is_err() {
@@ -78,6 +94,7 @@ impl DbPool {
     }
 
     /// Get a connection from the pool, blocking up to 5 seconds.
+    /// Expired connections (>1 hour) are transparently replaced with fresh ones.
     pub fn get(&self) -> Result<PooledConn<'_>> {
         if self.shutdown.load(Ordering::SeqCst) {
             anyhow::bail!("DB pool shutting down");
@@ -85,10 +102,29 @@ impl DbPool {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(conn) = conns.pop_front() {
+            if let Some((conn, created_at)) = conns.pop_front() {
+                // Recycle expired connections to release SQLite's internal caches.
+                if created_at.elapsed() > MAX_CONN_LIFETIME {
+                    drop(conn);
+                    match open_connection(&self.db_path) {
+                        Ok(fresh) => {
+                            return Ok(PooledConn {
+                                pool: self,
+                                conn: Some(fresh),
+                                created_at: Instant::now(),
+                                acquired_at: Instant::now(),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to replace expired SQLite connection: {e}");
+                            continue;
+                        }
+                    }
+                }
                 return Ok(PooledConn {
                     pool: self,
                     conn: Some(conn),
+                    created_at,
                     acquired_at: Instant::now(),
                 });
             }
@@ -155,18 +191,20 @@ pub fn open_pool(size: usize) -> Result<DbPool> {
 
     let first = open_connection(&db_path)?;
     migrate(&first)?;
+    let now = Instant::now();
 
     let mut conns = VecDeque::with_capacity(size);
-    conns.push_back(first);
+    conns.push_back((first, now));
 
     for _ in 1..size {
-        conns.push_back(open_connection(&db_path)?);
+        conns.push_back((open_connection(&db_path)?, now));
     }
 
     Ok(DbPool {
         conns: Mutex::new(conns),
         available: Condvar::new(),
         shutdown: AtomicBool::new(false),
+        db_path,
     })
 }
 
