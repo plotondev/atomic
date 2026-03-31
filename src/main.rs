@@ -28,12 +28,24 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("atomic=info".parse()?))
         .init();
 
-    // Clean up PID file on panic (best-effort). With panic=abort in release,
-    // the hook still runs before the process terminates.
+    // Clean up PID file and temp files on panic (best-effort).
+    // With panic=abort in release, the hook still runs before the process terminates.
     std::panic::set_hook(Box::new(|info| {
         eprintln!("atomic: fatal panic: {info}");
         if let Ok(path) = config::pid_path() {
             let _ = std::fs::remove_file(path);
+        }
+        // Clean temp files left by write_secure (atomic write pattern)
+        if let Ok(dir) = config::atomic_dir() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.contains(".tmp.") {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
         }
     }));
 

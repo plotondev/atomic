@@ -1,18 +1,23 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::config;
+
+/// Maximum lifetime for a pooled connection before it's recycled.
+/// Prevents SQLite page cache fragmentation from accumulating over hours/days.
+const CONN_MAX_LIFETIME: Duration = Duration::from_secs(1800); // 30 minutes
 
 /// Zero-dependency connection pool for SQLite.
 /// Uses a bounded sync_channel to distribute pre-opened connections.
 /// WAL mode allows concurrent readers; the pool prevents serialization
 /// behind a single Mutex<Connection>.
 pub struct DbPool {
-    sender: mpsc::SyncSender<Connection>,
-    receiver: std::sync::Mutex<mpsc::Receiver<Connection>>,
+    sender: mpsc::SyncSender<(Connection, Instant)>,
+    receiver: std::sync::Mutex<mpsc::Receiver<(Connection, Instant)>>,
+    db_path: PathBuf,
 }
 
 /// RAII guard that returns the connection to the pool on drop.
@@ -20,6 +25,7 @@ pub struct DbPool {
 pub struct PooledConn<'a> {
     pool: &'a DbPool,
     conn: Option<Connection>,
+    created_at: Instant,
     acquired_at: Instant,
 }
 
@@ -45,21 +51,37 @@ impl Drop for PooledConn<'_> {
             if held > Duration::from_secs(30) {
                 tracing::warn!("SQLite connection held for {:?}, possible leak", held);
             }
-            let _ = self.pool.sender.try_send(c);
+            let _ = self.pool.sender.try_send((c, self.created_at));
         }
     }
 }
 
 impl DbPool {
     /// Get a connection from the pool, blocking up to 5 seconds.
+    /// Connections older than 30 minutes are recycled to reset SQLite's
+    /// internal allocator and prevent page cache fragmentation.
     pub fn get(&self) -> Result<PooledConn<'_>> {
         let rx = self.receiver.lock().unwrap_or_else(|e| e.into_inner());
-        let conn = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+        let (conn, created_at) = rx
+            .recv_timeout(Duration::from_secs(5))
             .map_err(|_| anyhow::anyhow!("DB pool exhausted (5s timeout)"))?;
+
+        // Recycle stale connections to reset SQLite's internal allocator
+        if created_at.elapsed() > CONN_MAX_LIFETIME {
+            drop(conn);
+            let fresh = open_connection(&self.db_path)?;
+            return Ok(PooledConn {
+                pool: self,
+                conn: Some(fresh),
+                created_at: Instant::now(),
+                acquired_at: Instant::now(),
+            });
+        }
+
         Ok(PooledConn {
             pool: self,
             conn: Some(conn),
+            created_at,
             acquired_at: Instant::now(),
         })
     }
@@ -94,6 +116,10 @@ fn open_connection(db_path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_size_limit", "67108864")?;
     conn.pragma_update(None, "wal_autocheckpoint", "1000")?;
     conn.pragma_update(None, "mmap_size", "67108864")?;
+    // Process-wide SQLite memory limit to prevent OOM under sustained load
+    let _ = conn.pragma_update(None, "hard_heap_limit", "134217728"); // 128MB
+    // Increase prepared statement cache for hot query paths (default is 16)
+    conn.set_prepared_statement_cache_capacity(100);
 
     Ok(conn)
 }
@@ -107,16 +133,18 @@ pub fn open_pool(size: usize) -> Result<DbPool> {
     let first = open_connection(&db_path)?;
     migrate(&first)?;
 
+    let now = Instant::now();
     let (tx, rx) = mpsc::sync_channel(size);
-    tx.send(first).expect("channel just created");
+    tx.send((first, now)).expect("channel just created");
 
     for _ in 1..size {
-        tx.send(open_connection(&db_path)?).expect("channel just created");
+        tx.send((open_connection(&db_path)?, now)).expect("channel just created");
     }
 
     Ok(DbPool {
         sender: tx,
         receiver: std::sync::Mutex::new(rx),
+        db_path,
     })
 }
 

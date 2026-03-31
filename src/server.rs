@@ -460,8 +460,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         tokio::task::spawn_blocking(move || {
             match shutdown_state.db_pool.get() {
                 Ok(conn) => {
-                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                        tracing::warn!("Final WAL checkpoint failed: {e}");
+                    // RESTART checkpoints and resets the WAL header without truncating.
+                    // Safer than TRUNCATE which can block indefinitely if readers exist.
+                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(RESTART);") {
+                        tracing::warn!("Final WAL RESTART checkpoint failed: {e}, falling back to PASSIVE");
+                        if let Err(e2) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                            tracing::warn!("Final WAL PASSIVE checkpoint also failed: {e2}");
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("Final WAL checkpoint skipped: {e}"),
@@ -669,12 +674,19 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
         .map(|m| m.len() < 50 * 1024 * 1024)
         .unwrap_or(true); // WAL not existing is fine
 
-    if db_ok && agent_ok && wal_ok {
+    // Check disk space (>100MB free) to prevent SQLite "disk full" corruption
+    let disk_ok = crate::config::atomic_dir()
+        .ok()
+        .and_then(|d| fs2::available_space(&d).ok())
+        .map(|avail| avail > 100 * 1024 * 1024)
+        .unwrap_or(true); // If we can't check, assume ok
+
+    if db_ok && agent_ok && wal_ok && disk_ok {
         (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], r#"{"status":"ok"}"#).into_response()
     } else {
         let detail = format!(
-            r#"{{"status":"degraded","db":{},"agent_json":{},"wal_size_ok":{}}}"#,
-            db_ok, agent_ok, wal_ok
+            r#"{{"status":"degraded","db":{},"agent_json":{},"wal_size_ok":{},"disk_space_ok":{}}}"#,
+            db_ok, agent_ok, wal_ok, disk_ok
         );
         (StatusCode::SERVICE_UNAVAILABLE, [(header::CONTENT_TYPE, "application/json")], detail).into_response()
     }

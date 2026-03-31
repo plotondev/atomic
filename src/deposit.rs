@@ -63,9 +63,14 @@ fn try_verify_signature(
         .split_once('.')
         .ok_or_else(|| anyhow::anyhow!("No '.' separator in token"))?;
 
-    let sig_bytes = B64URL.decode(sig_b64)?;
-    let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
-        .map_err(|e| anyhow::anyhow!("Bad signature bytes: {e}"))?;
+    // Decode signature into stack-allocated buffer (zero heap allocation)
+    let mut sig_buf = [0u8; 64];
+    let sig_len = B64URL.decode_slice(sig_b64, &mut sig_buf)
+        .map_err(|e| anyhow::anyhow!("Bad signature: {e}"))?;
+    if sig_len != 64 {
+        anyhow::bail!("Signature must be 64 bytes, got {sig_len}");
+    }
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_buf);
 
     use ed25519_dalek::Verifier;
     verifying_key
