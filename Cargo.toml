@@ -43,7 +43,6 @@ sha2 = "0.10"
 # Random + encoding
 rand = "0.8"
 base64ct = { version = "1", features = ["alloc"] }
-hex = "0.4"
 
 # HTTP client (for verify command)
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -61,7 +60,6 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 
 # Misc
 bytes = "1"
-dirs = "6"
 zeroize = { version = "1.8.2", features = ["derive"] }
 fs2 = "0.4"
 tikv-jemallocator = { version = "0.6", optional = true }

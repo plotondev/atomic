@@ -204,6 +204,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                         Err(e) => { tracing::warn!("Failed to clean old deposit log entries: {e}"); break; }
                     }
                 }
+                // Reclaim pages freed by TTL deletes (auto_vacuum=INCREMENTAL).
+                let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
                 let _ = conn.execute_batch("PRAGMA optimize;");
             }).await;
         }

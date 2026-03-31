@@ -12,7 +12,8 @@ pub fn write_secure(path: &Path, data: &[u8]) -> Result<()> {
     // Random suffix prevents collisions between concurrent writers.
     let mut suffix = [0u8; 8];
     rand::rngs::OsRng.fill_bytes(&mut suffix);
-    let tmp_path = path.with_extension(format!("tmp.{}", hex::encode(suffix)));
+    let suffix_hex = u64::from_ne_bytes(suffix);
+    let tmp_path = path.with_extension(format!("tmp.{suffix_hex:016x}"));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -40,7 +41,9 @@ pub fn write_secure(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 pub fn atomic_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .context("Could not determine home directory (HOME not set)")?;
     Ok(home.join(".atomic"))
 }
 
@@ -165,7 +168,7 @@ mod tests {
     #[test]
     fn atomic_dir_under_home() {
         let dir = atomic_dir().unwrap();
-        let home = dirs::home_dir().unwrap();
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
         assert!(dir.starts_with(&home));
         assert!(dir.ends_with(".atomic"));
     }
