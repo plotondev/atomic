@@ -294,6 +294,20 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Rate limiter evicts one expired entry inline when DashMap is full instead of blanket-denying new IPs
 - Global per-second rate limit (20/s) on magic link claims prevents distributed brute-force
 
+**1c4ad26** — Kill auto-TLS/acme.sh, sharded-mutex rate limiter, Condvar pool, drop parse_duration, strip magic link hints, const-table validation, remove libc/dashmap/rustc-hash
+- `tls.rs`: remove Auto-TLS entirely — delete acme.sh shell execution, issue_cert, ensure_acme_sh, spawn_renewal_watcher. TLS now requires BYO cert (`--tls-cert`/`--tls-key`) or `--no-tls`. Eliminates shell injection risk and ~200 lines.
+- `server.rs`: replace DashMap with 8-shard `Mutex<HashMap>` rate limiter — removes `dashmap` + `rustc-hash` deps, zero contention for <10k entries, hourly stale cleanup.
+- `server.rs`: const lookup table (`ASCII_OK[256]`) for input validation — branchless, cache-friendly, auto-vectorizes.
+- `server.rs`: remove `libc::setrlimit` RLIMIT_NOFILE block — fd limits are sysadmin responsibility. Drops `libc` dep and only unsafe-adjacent code.
+- `server.rs`: SeqCst ordering on shutdown drain loop; hourly cleanup evicts stale rate limiter entries.
+- `db.rs`: replace `mpsc::sync_channel` pool with `Mutex<Vec>` + `Condvar` — simpler, faster for pool sizes 2-8. Same RAII guard, poison detection, panic-safe return.
+- `db.rs`: schema migration drops `hint` column from `magic_links` table.
+- `deposit.rs`: delete `parse_duration()` — CLI `--expires` now accepts u64 seconds directly. Removes suffix parsing, overflow checks, and 6 tests.
+- `deposit.rs`: remove debug logging from `verify_signature` — silent failure prevents info leakage.
+- `magic_link.rs`: strip 2-char hint from magic links — no longer store or display code prefix (metadata leak).
+- `init.rs`: require explicit `--tls-cert`/`--tls-key` or `--no-tls` (no more implicit auto-TLS).
+- Net: -479 lines, -3 dependencies (dashmap, rustc-hash, libc), 65 tests passing.
+
 **72f8305** — Constant-time magic link, fs cert watcher, FxHasher rate limiter, Acquire/Release circuit breaker, in-flight drain
 - `magic_link.rs`: SELECT + `subtle::ConstantTimeEq` before DELETE prevents timing side-channels on code existence
 - `main.rs`: jemalloc background thread enabled for aggressive memory purging of zeroed key material
@@ -332,7 +346,7 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - [x] Deposit box (signed URLs, encrypted vault, audit log)
 - [x] Magic links (domain verification)
 - [x] Request signing
-- [x] Auto-TLS
+- [x] TLS (BYO cert + SIGHUP reload)
 - [ ] NS delegation + hosted subdomains
 - [ ] Agent email
 - [ ] Capability declarations
