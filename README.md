@@ -206,6 +206,15 @@ cargo test               # 65 tests
 
 Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`.
 
+## Changelog
+
+**fcfffe5** — Production hardening: SQLite resilience, fsync durability, WAL checkpointing, zeroize decrypt output
+- SQLite: `busy_timeout=5s`, `journal_size_limit=64MB`, `synchronous=NORMAL` (WAL-safe)
+- Atomic writes: fsync data + parent directory on Unix for crash safety
+- Background WAL checkpoint (TRUNCATE) every 5 min to cap disk growth
+- X-Forwarded-For IP validation to reject spoofed non-IP values
+- `decrypt()` returns `Zeroizing<Vec<u8>>` — plaintext wiped from memory on drop
+
 ## Roadmap
 
 - [x] Identity (agent.json + Ed25519)
