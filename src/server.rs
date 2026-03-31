@@ -185,8 +185,11 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
     sk_bytes.iter_mut().for_each(|b| *b = 0); // belt-and-suspenders
     drop(sk_bytes);
 
-    // Connection pool with 4 connections — WAL mode allows concurrent readers
-    let db_pool = crate::db::open_pool(4)?;
+    // Size pool to available parallelism (capped 2..8) — WAL mode allows concurrent readers
+    let pool_size = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4);
+    let db_pool = crate::db::open_pool(pool_size)?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], credentials.port));
     let tls_mode = TlsMode::from_credentials(&credentials);
@@ -561,12 +564,20 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
     // Check agent.json is valid JSON
     let agent_ok = serde_json::from_slice::<serde_json::Value>(&state.agent_json_cached).is_ok();
 
-    if db_ok && agent_ok {
+    // Check WAL size is under control (< 50MB)
+    let wal_ok = crate::config::atomic_dir()
+        .map(|d| d.join("atomic.db-wal"))
+        .ok()
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .map(|m| m.len() < 50 * 1024 * 1024)
+        .unwrap_or(true); // WAL not existing is fine
+
+    if db_ok && agent_ok && wal_ok {
         (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], r#"{"status":"ok"}"#).into_response()
     } else {
         let detail = format!(
-            r#"{{"status":"degraded","db":{},"agent_json":{}}}"#,
-            db_ok, agent_ok
+            r#"{{"status":"degraded","db":{},"agent_json":{},"wal_size_ok":{}}}"#,
+            db_ok, agent_ok, wal_ok
         );
         (StatusCode::SERVICE_UNAVAILABLE, [(header::CONTENT_TYPE, "application/json")], detail).into_response()
     }
