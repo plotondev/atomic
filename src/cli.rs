@@ -92,18 +92,6 @@ pub enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
-
-    /// Key management
-    Key {
-        #[command(subcommand)]
-        command: KeyCommand,
-    },
-
-    /// Systemd service management
-    Service {
-        #[command(subcommand)]
-        command: ServiceCommand,
-    },
 }
 
 #[derive(Subcommand)]
@@ -127,22 +115,4 @@ pub enum VaultCommand {
         /// Label of the secret to delete
         label: String,
     },
-}
-
-#[derive(Subcommand)]
-pub enum KeyCommand {
-    /// Rotate the agent's keypair
-    Rotate,
-    /// Emergency revoke the agent's identity
-    Revoke,
-}
-
-#[derive(Subcommand)]
-pub enum ServiceCommand {
-    /// Install as systemd service
-    Install,
-    /// Uninstall systemd service
-    Uninstall,
-    /// Show service status
-    Status,
 }

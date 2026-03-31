@@ -164,6 +164,9 @@ fn open_connection(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
 
+    // auto_vacuum must be set before first table creation; no-op on existing DBs.
+    // INCREMENTAL avoids full-vacuum stalls while reclaiming space from TTL deletes.
+    let _ = conn.pragma_update(None, "auto_vacuum", "INCREMENTAL");
     // WAL mode: fast reads, lets multiple processes access the file
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -218,15 +221,12 @@ pub fn open() -> Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    // Drop legacy magic_links table if it exists (feature removed).
-    let _ = conn.execute_batch("DROP TABLE IF EXISTS magic_links;");
-
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS used_deposits (
             nonce      TEXT PRIMARY KEY,
             label      TEXT NOT NULL,
             used_at    INTEGER NOT NULL
-        );
+        ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS vault_secrets (
             label      TEXT PRIMARY KEY,

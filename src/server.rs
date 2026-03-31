@@ -183,8 +183,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 let cutoff = now - 7 * 86400;
                 loop {
                     match conn.execute(
-                        "DELETE FROM used_deposits WHERE rowid IN \
-                         (SELECT rowid FROM used_deposits WHERE used_at < ?1 LIMIT 1000)",
+                        "DELETE FROM used_deposits WHERE nonce IN \
+                         (SELECT nonce FROM used_deposits WHERE used_at < ?1 LIMIT 1000)",
                         [cutoff],
                     ) {
                         Ok(0) => break,

@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use cli::{Cli, Command, KeyCommand, ServiceCommand, VaultCommand};
+use cli::{Cli, Command, VaultCommand};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -196,19 +196,6 @@ async fn main() -> Result<()> {
         Command::Sign { dry_run, command } => {
             sign::run(&command, dry_run)?;
         }
-
-        Command::Key { command } => match command {
-            KeyCommand::Rotate => println!("Key rotation not yet implemented (PLO-58)"),
-            KeyCommand::Revoke => println!("Key revocation not yet implemented (PLO-58)"),
-        },
-
-        Command::Service { command } => match command {
-            ServiceCommand::Install => println!("Service install not yet implemented (PLO-59)"),
-            ServiceCommand::Uninstall => {
-                println!("Service uninstall not yet implemented (PLO-59)")
-            }
-            ServiceCommand::Status => println!("Service status not yet implemented (PLO-59)"),
-        },
     }
 
     Ok(())

@@ -41,49 +41,38 @@ pub fn create_signed_token(
 }
 
 /// Verify signature and expiry only (no DB access). Returns the payload if valid.
+/// Zero-allocation on failure — prevents DoS via invalid-request heap pressure.
 /// Silent on failure — no logging to prevent timing attacks and information leakage.
 pub fn verify_signature(
     token: &str,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Option<DepositPayload> {
-    try_verify_signature(token, verifying_key).ok()
-}
+    let (payload_b64, sig_b64) = token.split_once('.')?;
 
-fn try_verify_signature(
-    token: &str,
-    verifying_key: &ed25519_dalek::VerifyingKey,
-) -> Result<DepositPayload> {
-    let (payload_b64, sig_b64) = token
-        .split_once('.')
-        .ok_or_else(|| anyhow::anyhow!("No '.' separator in token"))?;
-
-    // Decode signature into stack-allocated buffer (zero heap allocation, constant-time)
+    // Stack-allocated signature decode (zero heap allocation)
     let mut sig_buf = [0u8; 64];
-    let sig_len = Base64UrlUnpadded::decode(sig_b64, &mut sig_buf)
-        .map_err(|_| anyhow::anyhow!("Bad signature encoding"))?
-        .len();
-    if sig_len != 64 {
-        anyhow::bail!("Signature must be 64 bytes, got {sig_len}");
+    let sig_decoded = Base64UrlUnpadded::decode(sig_b64, &mut sig_buf).ok()?;
+    if sig_decoded.len() != 64 {
+        return None;
     }
     let sig = ed25519_dalek::Signature::from_bytes(&sig_buf);
 
     verifying_key
         .verify_strict(payload_b64.as_bytes(), &sig)
-        .map_err(|e| anyhow::anyhow!("Signature invalid: {e}"))?;
+        .ok()?;
 
-    // Stack-allocated buffer for payload decoding (zero heap allocation).
-    // DepositPayload JSON is well under 512 bytes (label≤256 + nonce=32 + overhead).
-    let mut payload_buf = [0u8; 768];
-    let payload_bytes = Base64UrlUnpadded::decode(payload_b64, &mut payload_buf)
-        .map_err(|_| anyhow::anyhow!("Bad payload encoding"))?;
-    let payload: DepositPayload = serde_json::from_slice(payload_bytes)?;
+    // Stack-allocated payload decode (zero heap allocation).
+    // DepositPayload JSON is well under 768 bytes (label≤256 + nonce=32 + overhead).
+    let mut payload_buf = [0u8; 1024];
+    let payload_bytes = Base64UrlUnpadded::decode(payload_b64, &mut payload_buf).ok()?;
+    let payload: DepositPayload = serde_json::from_slice(payload_bytes).ok()?;
 
     let now = crate::config::epoch_secs() as i64;
     if payload.expires_at <= now {
-        anyhow::bail!("Token expired (expires_at={}, now={})", payload.expires_at, now);
+        return None;
     }
 
-    Ok(payload)
+    Some(payload)
 }
 
 /// Claim the nonce using a provided connection reference.
