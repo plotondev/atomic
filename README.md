@@ -208,6 +208,12 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 
 ## Changelog
 
+**e3eb87e** — Hard conn lifetime, WAL checkpoint timeout, vault label validation, jemalloc default
+- `PooledConn::drop` force-closes connections held >60s instead of returning to pool (prevents leaks from panicked threads or stuck queries)
+- Final WAL checkpoint wrapped in 5s `tokio::time::timeout` to prevent indefinite hang on shutdown if DB is stuck
+- `vault::cmd_set` validates labels with printable ASCII check (defense-in-depth, matching server-side `is_valid_input`)
+- jemalloc is now the default feature (`cargo build` enables it; `--no-default-features` to opt out)
+
 **1ba345e** — DashMap rate limiter, flock PID locking, jemalloc opt-in, connection leak detection
 - Replace `Mutex<HashMap>` rate limiter with `DashMap` (sharded locks, no global contention under high concurrency)
 - PID file locking via `flock` prevents double-start races; lock auto-released on crash by kernel
