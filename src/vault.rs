@@ -31,7 +31,10 @@ pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<String>> {
     match result {
         Some(encrypted) => {
             let plaintext = crypto_vault::decrypt(vault_key, &encrypted)?;
-            let value = String::from_utf8(plaintext).context("Vault value is not valid UTF-8")?;
+            // plaintext is Zeroizing<Vec<u8>> — borrow, convert, then let it drop (zeroing memory)
+            let value = std::str::from_utf8(&plaintext)
+                .context("Vault value is not valid UTF-8")?
+                .to_string();
             Ok(Some(value))
         }
         None => Ok(None),
@@ -136,7 +139,7 @@ mod tests {
         let mut stmt = conn.prepare("SELECT value FROM vault_secrets WHERE label = ?1").unwrap();
         let encrypted: Vec<u8> = stmt.query_row(["api_key"], |row| row.get(0)).unwrap();
         let decrypted = cv::decrypt(&key, &encrypted).unwrap();
-        assert_eq!(String::from_utf8(decrypted).unwrap(), "sk-12345");
+        assert_eq!(std::str::from_utf8(&decrypted).unwrap(), "sk-12345");
     }
 
     #[test]
@@ -148,7 +151,7 @@ mod tests {
         let mut stmt = conn.prepare("SELECT value FROM vault_secrets WHERE label = ?1").unwrap();
         let encrypted: Vec<u8> = stmt.query_row(["k"], |row| row.get(0)).unwrap();
         let decrypted = cv::decrypt(&key, &encrypted).unwrap();
-        assert_eq!(String::from_utf8(decrypted).unwrap(), "v2");
+        assert_eq!(std::str::from_utf8(&decrypted).unwrap(), "v2");
     }
 
     #[test]

@@ -106,6 +106,22 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         rate_limiter: std::sync::Mutex::new(HashMap::with_capacity(256)),
     });
 
+    // Background task: WAL checkpoint every 5 minutes to prevent unbounded WAL growth
+    let wal_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            let db_ref = wal_state.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = db_ref.db.lock() {
+                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                        tracing::warn!("WAL checkpoint failed: {e}");
+                    }
+                }
+            }).await;
+        }
+    });
+
     // Background task: clean expired magic links, old deposit nonces, and stale rate limiter entries
     let db_clone = state.clone();
     tokio::spawn(async move {
@@ -233,14 +249,19 @@ async fn handle_deposit(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // Only trust X-Forwarded-For when running behind a known reverse proxy
+    // Only trust X-Forwarded-For when running behind a known reverse proxy.
+    // Parse the rightmost entry as IpAddr to reject spoofed non-IP values.
     let source_ip = if state.behind_proxy {
         headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit(',').next())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| addr.ip().to_string())
+            .and_then(|v| {
+                v.rsplit(',')
+                    .next()
+                    .and_then(|s| s.trim().parse::<IpAddr>().ok())
+            })
+            .unwrap_or_else(|| addr.ip())
+            .to_string()
     } else {
         addr.ip().to_string()
     };

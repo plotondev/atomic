@@ -23,8 +23,10 @@ pub fn open() -> Result<Connection> {
 
     // WAL mode: fast reads, lets multiple processes access the file
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?; // NORMAL is safe with WAL mode
     conn.pragma_update(None, "cache_size", "-2000")?;
+    conn.pragma_update(None, "busy_timeout", "5000")?; // Wait 5s for locks under contention
+    conn.pragma_update(None, "journal_size_limit", "67108864")?; // Cap WAL at 64MB
 
     // CREATE TABLE IF NOT EXISTS is idempotent — safe to run every time
     migrate(&conn)?;

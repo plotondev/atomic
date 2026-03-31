@@ -22,9 +22,20 @@ pub fn write_secure(path: &Path, data: &[u8]) -> Result<()> {
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
     file.write_all(data)
         .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Failed to fsync {}", tmp_path.display()))?;
     drop(file);
     std::fs::rename(&tmp_path, path)
         .with_context(|| format!("Failed to rename {} to {}", tmp_path.display(), path.display()))?;
+
+    // fsync parent directory to ensure rename durability (POSIX requirement)
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
     Ok(())
 }
 

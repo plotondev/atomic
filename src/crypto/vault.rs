@@ -40,7 +40,8 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 }
 
 // Expects 12-byte nonce prepended to ciphertext (same format encrypt() produces).
-pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
+// Returns Zeroizing<Vec<u8>> so plaintext is wiped from memory on drop.
+pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if data.len() < NONCE_SIZE {
         anyhow::bail!("Encrypted data too short");
     }
@@ -50,10 +51,12 @@ pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
     let nonce = Nonce::from_slice(nonce_bytes);
 
-    cipher
+    let plaintext = cipher
         .decrypt(nonce, ciphertext)
         .map_err(|_| anyhow::anyhow!("Decryption failed (wrong key or corrupted data)"))
-        .context("Vault decryption failed")
+        .context("Vault decryption failed")?;
+
+    Ok(Zeroizing::new(plaintext))
 }
 
 #[cfg(test)]
@@ -66,7 +69,7 @@ mod tests {
         let plaintext = b"secret data here";
         let encrypted = encrypt(&key, plaintext).unwrap();
         let decrypted = decrypt(&key, &encrypted).unwrap();
-        assert_eq!(plaintext.to_vec(), decrypted);
+        assert_eq!(plaintext.as_slice(), &*decrypted);
     }
 
     #[test]
@@ -112,7 +115,7 @@ mod tests {
         let key = [42u8; 32];
         let encrypted = encrypt(&key, b"").unwrap();
         let decrypted = decrypt(&key, &encrypted).unwrap();
-        assert!(decrypted.is_empty());
+        assert!((*decrypted).is_empty());
     }
 
     #[test]
