@@ -259,6 +259,12 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Startup guard: warn if `RLIMIT_NOFILE < 4096` (prevents cryptic fd exhaustion under TLS load)
 - Startup guard: warn if log file exceeds 100MB (prevents disk-full failures on vault atomic writes)
 
+**7b45baf** — Replace exit(1) circuit breaker with max backoff, monotonic rate limiter, bounded pool
+- Circuit breaker no longer calls `process::exit(1)` — enters 320s max backoff instead, so destructors run (Zeroizing wipes vault keys, final WAL checkpoint completes)
+- Rate limiter uses monotonic `Instant` instead of wall-clock `i64` timestamps, preventing clock-skew manipulation of rate windows
+- Rate limiter eviction split into dedicated 5-minute task (was hourly), bounding DashMap memory under sustained attack
+- Connection pool uses bounded `sync_channel(size)` instead of unbounded `channel()` for explicit capacity enforcement
+
 **5fc281e** — AES-GCM zeroize, dynamic pool sizing, health check WAL monitor
 - Enable `zeroize` feature on `aes-gcm`: AES key schedule is now wiped from memory on cipher drop
 - DB connection pool sized dynamically via `available_parallelism()` (clamped 2..8) instead of hardcoded 4
