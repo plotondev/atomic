@@ -271,6 +271,11 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Rate limiter eviction split into dedicated 5-minute task (was hourly), bounding DashMap memory under sustained attack
 - Connection pool uses bounded `sync_channel(size)` instead of unbounded `channel()` for explicit capacity enforcement
 
+**64d8ea4** — Zeroize vault plaintext return, cleanup indexes, paginated deletes
+- `vault_get` returns `Zeroizing<String>` so decrypted plaintext is wiped from heap on drop instead of left in freed memory
+- Added indexes on `expires_at`, `used_at`, `deposited_at` columns to eliminate full table scans during hourly cleanup
+- Paginated cleanup DELETEs (1000 rows/batch via rowid subquery) to prevent long WAL write locks under heavy load
+
 **756eadb** — Cooperative conn interrupt, prepared statement cache, request timeout, global magic link rate limit
 - `db.rs`: call `interrupt()` before force-closing stale SQLite connections for clean WAL rollback
 - Hot-path DB queries (`deposit`, `magic_link`, `vault`) switched to `prepare_cached()` to eliminate repeated SQL parse overhead
