@@ -24,8 +24,9 @@ pub fn open() -> Result<Connection> {
     // WAL mode: fast reads, lets multiple processes access the file
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?; // NORMAL is safe with WAL mode
-    conn.pragma_update(None, "cache_size", "-2000")?;
+    conn.pragma_update(None, "cache_size", "-64000")?; // 64MB page cache
     conn.pragma_update(None, "busy_timeout", "5000")?; // Wait 5s for locks under contention
+    conn.pragma_update(None, "temp_store", "MEMORY")?; // Temp tables/indexes in memory
     conn.pragma_update(None, "journal_size_limit", "67108864")?; // Cap WAL at 64MB
     conn.pragma_update(None, "wal_autocheckpoint", "1000")?; // Checkpoint every 1000 pages
     conn.pragma_update(None, "mmap_size", "67108864")?; // 64MB memory-mapped I/O for reads

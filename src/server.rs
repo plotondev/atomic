@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -19,9 +20,37 @@ use crate::config;
 use crate::credentials::Credentials;
 use crate::tls::TlsMode;
 
+/// Spawn a supervised background task that restarts on panic/error with backoff.
+fn spawn_supervised<F, Fut>(name: &'static str, make_task: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let result = tokio::spawn(make_task()).await;
+            match result {
+                Ok(()) => break, // clean exit
+                Err(e) => {
+                    tracing::error!("{name} task panicked: {e}. Restarting in 5s...");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    });
+}
+
 const RATE_LIMIT_WINDOW_SECS: i64 = 60;
 const RATE_LIMIT_MAX_REQUESTS: u32 = 10;
 const RATE_LIMIT_MAX_ENTRIES: usize = 10_000;
+const MAX_INPUT_LEN: usize = 256;
+
+/// Reject inputs with non-printable characters or excessive length.
+fn is_valid_input(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_INPUT_LEN
+        && s.bytes().all(|b| b >= 0x20 && b != 0x7F)
+}
 
 pub struct AppState {
     pub agent_json_cached: bytes::Bytes,
@@ -108,28 +137,32 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
 
     // Background task: WAL checkpoint every 5 minutes to prevent unbounded WAL growth
     let wal_state = state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-            let db_ref = wal_state.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = db_ref.db.lock() {
+    spawn_supervised("wal-checkpoint", move || {
+        let st = wal_state.clone();
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                let db_ref = st.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let conn = db_ref.db.lock().unwrap_or_else(|e| e.into_inner());
                     if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
                         tracing::warn!("WAL checkpoint failed: {e}");
                     }
-                }
-            }).await;
+                }).await;
+            }
         }
     });
 
     // Background task: clean expired magic links, old deposit nonces, and stale rate limiter entries
-    let db_clone = state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            let db_ref = db_clone.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = db_ref.db.lock() {
+    let cleanup_state = state.clone();
+    spawn_supervised("db-cleanup", move || {
+        let st = cleanup_state.clone();
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                let db_ref = st.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let conn = db_ref.db.lock().unwrap_or_else(|e| e.into_inner());
                     let now = chrono::Utc::now().timestamp();
                     if let Err(e) = conn.execute("DELETE FROM magic_links WHERE expires_at <= ?1", [now]) {
                         tracing::warn!("Failed to clean expired magic links: {e}");
@@ -138,13 +171,12 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                     if let Err(e) = conn.execute("DELETE FROM used_deposits WHERE used_at < ?1", [cutoff]) {
                         tracing::warn!("Failed to clean old deposit nonces: {e}");
                     }
-                }
-                // Evict stale rate limiter entries
-                if let Ok(mut map) = db_ref.rate_limiter.lock() {
+                    // Evict stale rate limiter entries
+                    let mut map = db_ref.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
                     let now = chrono::Utc::now().timestamp();
                     map.retain(|_, (_, window_start)| now - *window_start <= RATE_LIMIT_WINDOW_SECS);
-                }
-            }).await;
+                }).await;
+            }
         }
     });
 
@@ -166,6 +198,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .merge(public_routes)
         .route("/d/{token}", post(handle_deposit))
         .route("/m/{code}", get(handle_magic_link))
+        .route("/_/health", get(handle_health))
         .fallback(handle_404)
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .layer(middleware::from_fn_with_state(
@@ -282,7 +315,8 @@ async fn handle_deposit(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    if body.is_empty() {
+    // Reject empty body or labels with non-printable/overlong content
+    if body.is_empty() || !is_valid_input(&payload.label) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -300,6 +334,16 @@ async fn handle_deposit(
             .unwrap_or_else(|| addr.ip())
             .to_string()
     } else {
+        // Warn once if XFF header is present without proxy mode — likely misconfiguration
+        if headers.contains_key("x-forwarded-for") {
+            tracing::warn_span!("deposit").in_scope(|| {
+                tracing::warn!(
+                    "X-Forwarded-For header present but behind_proxy=false; \
+                     ignoring header and using direct IP. \
+                     If behind a reverse proxy, re-init with --proxy."
+                );
+            });
+        }
         addr.ip().to_string()
     };
     let user_agent = headers
@@ -357,8 +401,8 @@ async fn handle_magic_link(
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
-    // Reject obviously short codes before touching the DB (host() enforces >= 20 chars)
-    if code.len() < 20 {
+    // Reject obviously short codes or codes with non-printable chars before touching the DB
+    if code.len() < 20 || !is_valid_input(&code) {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -387,6 +431,32 @@ async fn handle_magic_link(
             tracing::error!("Magic link task panicked: {e}");
             StatusCode::NOT_FOUND.into_response()
         }
+    }
+}
+
+async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
+    // Check DB is responsive
+    let db_ok = {
+        let st = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = st.db.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute_batch("SELECT 1").is_ok()
+        })
+        .await
+        .unwrap_or(false)
+    };
+
+    // Check agent.json is valid JSON
+    let agent_ok = serde_json::from_slice::<serde_json::Value>(&state.agent_json_cached).is_ok();
+
+    if db_ok && agent_ok {
+        (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], r#"{"status":"ok"}"#).into_response()
+    } else {
+        let detail = format!(
+            r#"{{"status":"degraded","db":{},"agent_json":{}}}"#,
+            db_ok, agent_ok
+        );
+        (StatusCode::SERVICE_UNAVAILABLE, [(header::CONTENT_TYPE, "application/json")], detail).into_response()
     }
 }
 
