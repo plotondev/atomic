@@ -284,6 +284,16 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Rate limiter evicts one expired entry inline when DashMap is full instead of blanket-denying new IPs
 - Global per-second rate limit (20/s) on magic link claims prevents distributed brute-force
 
+**72f8305** — Constant-time magic link, fs cert watcher, FxHasher rate limiter, Acquire/Release circuit breaker, in-flight drain
+- `magic_link.rs`: SELECT + `subtle::ConstantTimeEq` before DELETE prevents timing side-channels on code existence
+- `main.rs`: jemalloc background thread enabled for aggressive memory purging of zeroed key material
+- `tls.rs`: 12h cert polling replaced with `notify` filesystem watcher (kqueue/inotify) + polling fallback for network FS
+- `server.rs`: DashMap rate limiter uses `FxHasher` (~2-3x faster for IP keys vs SipHash)
+- `server.rs`: circuit breaker atomics upgraded from `Relaxed` to `Acquire/Release` for ARM/weak-ordering correctness
+- `server.rs`: in-flight request counter with 30s drain before WAL checkpoint on shutdown
+- `server.rs`: `MAX_BODY_SIZE` reduced from 1MB to 64KB (sufficient for secrets/API keys/certs)
+- `db.rs`: `catch_unwind` in `PooledConn::Drop` prevents double-panic abort from skipping `Zeroizing` destructors
+
 **4bc32f4** — Pool poison detection, DB circuit breaker, RLIMIT_NOFILE enforcement, proactive WAL truncation
 - `PooledConn::drop` checks `is_autocommit()` and rolls back active transactions before returning to pool (prevents poisoned connections)
 - Per-request DB circuit breaker: opens after 5 consecutive failures, returns 503+Retry-After:30 for 30s cool-down
