@@ -20,20 +20,23 @@ use crate::config;
 use crate::credentials::Credentials;
 use crate::tls::TlsMode;
 
-/// Spawn a supervised background task that restarts on panic/error with backoff.
+/// Spawn a supervised background task that restarts on panic/error with exponential backoff.
 fn spawn_supervised<F, Fut>(name: &'static str, make_task: F)
 where
     F: Fn() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
+        let mut retries: u32 = 0;
         loop {
             let result = tokio::spawn(make_task()).await;
             match result {
                 Ok(()) => break, // clean exit
                 Err(e) => {
-                    tracing::error!("{name} task panicked: {e}. Restarting in 5s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let delay_secs = 5_u64.saturating_mul(1u64 << retries.min(6)); // 5s, 10s, 20s, ..., 320s (capped)
+                    tracing::error!("{name} task panicked: {e}. Restarting in {delay_secs}s...");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    retries = retries.saturating_add(1);
                 }
             }
         }
@@ -170,6 +173,11 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                     let cutoff = now - 7 * 86400;
                     if let Err(e) = conn.execute("DELETE FROM used_deposits WHERE used_at < ?1", [cutoff]) {
                         tracing::warn!("Failed to clean old deposit nonces: {e}");
+                    }
+                    // Purge deposit log entries older than 90 days to prevent unbounded disk growth
+                    let log_cutoff = now - 90 * 86400;
+                    if let Err(e) = conn.execute("DELETE FROM deposit_log WHERE deposited_at < ?1", [log_cutoff]) {
+                        tracing::warn!("Failed to clean old deposit log entries: {e}");
                     }
                     // Evict stale rate limiter entries
                     let mut map = db_ref.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
