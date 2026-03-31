@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 use crate::config;
 
 /// Zero-dependency connection pool for SQLite.
-/// Uses a bounded channel to distribute pre-opened connections.
+/// Uses a bounded sync_channel to distribute pre-opened connections.
 /// WAL mode allows concurrent readers; the pool prevents serialization
 /// behind a single Mutex<Connection>.
 pub struct DbPool {
-    sender: mpsc::Sender<Connection>,
+    sender: mpsc::SyncSender<Connection>,
     receiver: std::sync::Mutex<mpsc::Receiver<Connection>>,
 }
 
@@ -37,7 +37,7 @@ impl Drop for PooledConn<'_> {
             if held > Duration::from_secs(30) {
                 tracing::warn!("SQLite connection held for {:?}, possible leak", held);
             }
-            let _ = self.pool.sender.send(c);
+            let _ = self.pool.sender.try_send(c);
         }
     }
 }
@@ -99,7 +99,7 @@ pub fn open_pool(size: usize) -> Result<DbPool> {
     let first = open_connection(&db_path)?;
     migrate(&first)?;
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(size);
     tx.send(first).expect("channel just created");
 
     for _ in 1..size {

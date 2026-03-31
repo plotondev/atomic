@@ -30,8 +30,9 @@ const SUPERVISOR_WINDOW_SECS: u64 = 300; // 5 minutes
 const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Spawn a supervised background task that restarts on panic/error with exponential backoff.
-/// Circuit breaker: if 5 restarts occur within 5 minutes, abort the process to prevent
-/// resource exhaustion on unrecoverable errors (e.g., SQLite corruption).
+/// Circuit breaker: if 5 restarts occur within 5 minutes, enter max backoff (320s) instead
+/// of killing the process — process::exit skips destructors, preventing Zeroizing from
+/// wiping vault keys and the final WAL checkpoint from running.
 fn spawn_supervised<F, Fut>(name: &'static str, make_task: F)
 where
     F: Fn() -> Fut + Send + 'static,
@@ -41,6 +42,7 @@ where
         let mut retries: u32 = 0;
         let mut window_start = std::time::Instant::now();
         let mut window_restarts: u32 = 0;
+        let mut circuit_open = false;
         loop {
             let result = tokio::spawn(make_task()).await;
             match result {
@@ -51,16 +53,25 @@ where
                     if now.duration_since(window_start).as_secs() > SUPERVISOR_WINDOW_SECS {
                         window_start = now;
                         window_restarts = 0;
+                        if circuit_open {
+                            tracing::info!("{name}: circuit breaker reset after quiet period");
+                            circuit_open = false;
+                            retries = 0;
+                        }
                     }
                     window_restarts += 1;
-                    if window_restarts >= SUPERVISOR_MAX_RESTARTS {
+                    if window_restarts >= SUPERVISOR_MAX_RESTARTS && !circuit_open {
                         tracing::error!(
-                            "{name} task failed {SUPERVISOR_MAX_RESTARTS} times in {SUPERVISOR_WINDOW_SECS}s — aborting process"
+                            "{name}: circuit breaker OPEN — {SUPERVISOR_MAX_RESTARTS} failures in {SUPERVISOR_WINDOW_SECS}s, entering max backoff"
                         );
-                        std::process::exit(1);
+                        circuit_open = true;
                     }
 
-                    let delay_secs = 5_u64.saturating_mul(1u64 << retries.min(6)); // 5s, 10s, 20s, ..., 320s (capped)
+                    let delay_secs = if circuit_open {
+                        320 // Max backoff while circuit is open
+                    } else {
+                        5_u64.saturating_mul(1u64 << retries.min(6)) // 5s, 10s, 20s, ..., 320s
+                    };
                     tracing::error!("{name} task panicked: {e}. Restarting in {delay_secs}s ({window_restarts}/{SUPERVISOR_MAX_RESTARTS} in window)...");
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                     retries = retries.saturating_add(1);
@@ -70,7 +81,7 @@ where
     });
 }
 
-const RATE_LIMIT_WINDOW_SECS: i64 = 60;
+const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const RATE_LIMIT_MAX_REQUESTS: u32 = 10;
 const RATE_LIMIT_MAX_ENTRIES: usize = 10_000;
 const MAX_INPUT_LEN: usize = 256;
@@ -92,7 +103,8 @@ pub struct AppState {
     pub tls_active: bool,
     pub behind_proxy: bool,
     /// Sharded concurrent map — no global mutex contention under high concurrency.
-    rate_limiter: DashMap<IpAddr, (u32, i64)>,
+    /// Uses monotonic Instant (not wall clock) to prevent clock-skew manipulation.
+    rate_limiter: DashMap<IpAddr, (u32, std::time::Instant)>,
 }
 
 impl AppState {
@@ -102,14 +114,16 @@ impl AppState {
 
     /// Returns true if the request is within rate limits.
     /// Uses DashMap (sharded locks) so concurrent requests don't serialize on a global mutex.
+    /// Monotonic Instant prevents clock-skew attacks from resetting windows.
     pub fn check_rate_limit(&self, ip: IpAddr) -> bool {
-        let now = chrono::Utc::now().timestamp();
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
         // Hard cap as defense-in-depth (approximate len is fine for rate limiting)
         if self.rate_limiter.len() >= RATE_LIMIT_MAX_ENTRIES {
             return false;
         }
         let mut entry = self.rate_limiter.entry(ip).or_insert((0, now));
-        if now - entry.1 > RATE_LIMIT_WINDOW_SECS {
+        if now.duration_since(entry.1) > window {
             *entry = (1, now);
             true
         } else if entry.0 >= RATE_LIMIT_MAX_REQUESTS {
@@ -230,7 +244,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         }
     });
 
-    // Background task: clean expired magic links, old deposit nonces, and stale rate limiter entries
+    // Background task: clean expired magic links, old deposit nonces, and rate limiter entries
     let cleanup_state = state.clone();
     spawn_supervised("db-cleanup", move || {
         let st = cleanup_state.clone();
@@ -265,12 +279,22 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                     }
                     // Let SQLite update its query planner statistics
                     let _ = conn.execute_batch("PRAGMA optimize;");
-                    // Drop connection back to pool before touching rate limiter
-                    drop(conn);
-                    // Evict stale rate limiter entries (DashMap::retain is lock-free per shard)
-                    let now = chrono::Utc::now().timestamp();
-                    db_ref.rate_limiter.retain(|_, (_, window_start)| now - *window_start <= RATE_LIMIT_WINDOW_SECS);
                 }).await;
+            }
+        }
+    });
+
+    // Background task: evict stale rate limiter entries every 5 minutes.
+    // More aggressive than hourly to bound DashMap memory under sustained attack.
+    let rl_state = state.clone();
+    spawn_supervised("rate-limiter-evict", move || {
+        let st = rl_state.clone();
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                let cutoff = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+                let now = std::time::Instant::now();
+                st.rate_limiter.retain(|_, (_, window_start)| now.duration_since(*window_start) <= cutoff);
             }
         }
     });
