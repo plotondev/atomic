@@ -191,6 +191,14 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 
 ## Changelog
 
+**4ff9c9b** — Remove hex+dirs crates, incremental vacuum
+- `Cargo.toml`: remove `hex` and `dirs` dependencies (−2 crates, −55 lines from Cargo.lock). Fewer transitive deps, faster compile, smaller binary.
+- `deposit.rs`: nonce generation uses `Base64UrlUnpadded::encode_string` (already imported) instead of `hex::encode`. More compact nonces (22 chars vs 32).
+- `config.rs`: temp file suffix uses `u64::from_ne_bytes` + `{:016x}` format instead of `hex::encode`. Zero-dep hex formatting.
+- `config.rs`: `atomic_dir()` uses `std::env::var("HOME")` instead of `dirs::home_dir()`. The `dirs` crate was a wrapper over `$HOME` on Unix — the only platform supported per `#[cfg(unix)]` gates.
+- `server.rs`: hourly maintenance task now runs `PRAGMA incremental_vacuum` after TTL deletes. `auto_vacuum=INCREMENTAL` was set in iter 28 but never triggered — pages freed by nonce/log cleanup were not being reclaimed.
+- Net: −61 lines / +9 lines (−52 net), −2 dependencies, 61 tests passing.
+
 **182f8ad** — Zero-alloc deposit verify, WITHOUT ROWID, auto_vacuum, remove stub commands
 - `deposit.rs`: eliminate `try_verify_signature` indirection — `verify_signature` now returns `Option` directly with zero heap allocation on failure. Removes all `anyhow` from the deposit verification hot path (no `Box<dyn Error>` per invalid request), hardening against DoS via invalid-token heap pressure. Stack buffer increased from 768→1024 bytes.
 - `db.rs`: add `PRAGMA auto_vacuum = INCREMENTAL` — reclaims space from TTL-deleted deposit nonces without full-vacuum stalls. Set before table creation so new databases get incremental auto-vacuum from the start.
