@@ -139,6 +139,7 @@ dependencies = [
  "fs2",
  "hex",
  "hkdf",
+ "libc",
  "rand 0.8.5",
  "reqwest",
  "rusqlite",

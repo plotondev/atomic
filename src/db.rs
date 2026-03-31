@@ -51,6 +51,13 @@ impl Drop for PooledConn<'_> {
             if held > Duration::from_secs(30) {
                 tracing::warn!("SQLite connection held for {:?}, possible leak", held);
             }
+            // Poison detection: if a transaction is still active (e.g., handler panicked
+            // mid-write), roll it back before returning to the pool. Returning a dirty
+            // connection could corrupt subsequent operations on that pooled handle.
+            if !c.is_autocommit() {
+                tracing::warn!("Returning connection with active transaction, rolling back");
+                let _ = c.execute_batch("ROLLBACK");
+            }
             let _ = self.pool.sender.try_send((c, self.created_at));
         }
     }

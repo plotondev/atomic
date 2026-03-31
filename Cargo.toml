@@ -69,6 +69,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 dashmap = "6"
 fs2 = "0.4"
 tikv-jemallocator = { version = "0.6", optional = true }
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

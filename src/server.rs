@@ -87,6 +87,18 @@ const RATE_LIMIT_MAX_ENTRIES: usize = 10_000;
 const MAGIC_LINK_GLOBAL_MAX_PER_SEC: u32 = 20;
 const MAX_INPUT_LEN: usize = 256;
 
+/// Consecutive DB failures before the circuit breaker opens.
+const DB_CIRCUIT_THRESHOLD: u32 = 5;
+/// How long (seconds) the circuit stays open before allowing a probe request.
+const DB_CIRCUIT_OPEN_SECS: u64 = 30;
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Reject inputs with non-printable characters or excessive length.
 fn is_valid_input(s: &str) -> bool {
     !s.is_empty()
@@ -110,6 +122,10 @@ pub struct AppState {
     magic_link_window: std::sync::atomic::AtomicI64,
     /// Count of magic link claims in the current 1-second window.
     magic_link_count: std::sync::atomic::AtomicU32,
+    /// Circuit breaker: consecutive DB operation failure count.
+    db_fail_count: std::sync::atomic::AtomicU32,
+    /// Circuit breaker: epoch second when circuit opened (0 = closed).
+    db_circuit_opened_at: std::sync::atomic::AtomicU64,
 }
 
 impl AppState {
@@ -146,6 +162,38 @@ impl AppState {
         }
     }
 
+    /// Record a DB operation failure. Opens the circuit after DB_CIRCUIT_THRESHOLD consecutive failures.
+    fn record_db_failure(&self) {
+        let count = self.db_fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if count >= DB_CIRCUIT_THRESHOLD {
+            let now = epoch_secs();
+            let prev = self.db_circuit_opened_at.load(std::sync::atomic::Ordering::Relaxed);
+            if prev == 0 {
+                self.db_circuit_opened_at.store(now, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!("DB circuit breaker OPEN after {count} consecutive failures");
+            }
+        }
+    }
+
+    /// Record a successful DB operation. Resets the circuit breaker.
+    fn record_db_success(&self) {
+        self.db_fail_count.store(0, std::sync::atomic::Ordering::Relaxed);
+        if self.db_circuit_opened_at.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            self.db_circuit_opened_at.store(0, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("DB circuit breaker closed after successful operation");
+        }
+    }
+
+    /// Returns true if the circuit is open (DB operations should be rejected).
+    fn is_db_circuit_open(&self) -> bool {
+        let opened_at = self.db_circuit_opened_at.load(std::sync::atomic::Ordering::Relaxed);
+        if opened_at == 0 {
+            return false;
+        }
+        // Allow a probe request after the cool-down period (half-open state)
+        epoch_secs().saturating_sub(opened_at) < DB_CIRCUIT_OPEN_SECS
+    }
+
     /// Global rate limit for magic link claim attempts (across all IPs).
     /// Prevents distributed brute-force even if each IP stays under per-IP limits.
     fn check_magic_link_global_rate(&self) -> bool {
@@ -178,20 +226,29 @@ const MAX_BODY_SIZE: usize = 1024 * 1024;
 pub async fn run_server(credentials: Credentials) -> Result<()> {
     // --- Startup checks ---
 
-    // Fix 6: Warn if file descriptor limit is too low for a long-lived TLS server
+    // Enforce file descriptor limit: raise soft limit toward 65535 if below 4096.
+    // Without enough fds, a connection spike causes "too many open files" crashes.
     #[cfg(unix)]
     {
-        if let Ok(output) = std::process::Command::new("sh")
-            .args(["-c", "ulimit -n"])
-            .output()
-        {
-            if let Ok(s) = std::str::from_utf8(&output.stdout) {
-                if let Ok(n) = s.trim().parse::<u64>() {
-                    if n < 4096 {
+        let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } == 0 {
+            let current = rlim.rlim_cur;
+            if current < 4096 {
+                let target = rlim.rlim_max.min(65535);
+                if target >= 4096 {
+                    rlim.rlim_cur = target;
+                    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) } == 0 {
+                        tracing::info!("Raised RLIMIT_NOFILE soft limit: {current} → {target}");
+                    } else {
                         tracing::warn!(
-                            "RLIMIT_NOFILE is {n}, recommended minimum 4096 for production"
+                            "Failed to raise RLIMIT_NOFILE from {current} to {target}"
                         );
                     }
+                } else {
+                    anyhow::bail!(
+                        "RLIMIT_NOFILE hard limit is {} (need ≥4096). Raise with: ulimit -n 4096",
+                        rlim.rlim_max
+                    );
                 }
             }
         }
@@ -253,6 +310,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         rate_limiter: DashMap::with_capacity(256),
         magic_link_window: std::sync::atomic::AtomicI64::new(0),
         magic_link_count: std::sync::atomic::AtomicU32::new(0),
+        db_fail_count: std::sync::atomic::AtomicU32::new(0),
+        db_circuit_opened_at: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Background task: WAL checkpoint every 5 minutes (PASSIVE to avoid blocking writers;
@@ -265,9 +324,24 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                 let db_ref = st.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    // Check WAL file size: escalate from PASSIVE to TRUNCATE if >40MB
+                    // to prevent unbounded WAL growth under heavy reader load.
+                    let wal_large = crate::config::atomic_dir()
+                        .map(|d| d.join("atomic.db-wal"))
+                        .ok()
+                        .and_then(|p| std::fs::metadata(&p).ok())
+                        .map(|m| m.len() > 40 * 1024 * 1024)
+                        .unwrap_or(false);
+
                     match db_ref.db_pool.get() {
                         Ok(conn) => {
-                            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                            if wal_large {
+                                tracing::warn!("WAL exceeds 40MB, forcing TRUNCATE checkpoint");
+                                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                                    tracing::warn!("WAL TRUNCATE checkpoint failed: {e}, falling back to RESTART");
+                                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(RESTART);");
+                                }
+                            } else if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
                                 tracing::warn!("WAL checkpoint failed: {e}");
                             }
                         }
@@ -352,9 +426,14 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                let cutoff = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
-                let now = std::time::Instant::now();
-                st.rate_limiter.retain(|_, (_, window_start)| now.duration_since(*window_start) <= cutoff);
+                // Offload O(n) DashMap scan to the blocking pool to avoid stalling
+                // the async executor under 100k+ entries.
+                let st2 = st.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let cutoff = std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+                    let now = std::time::Instant::now();
+                    st2.rate_limiter.retain(|_, (_, window_start)| now.duration_since(*window_start) <= cutoff);
+                }).await;
             }
         }
     });
@@ -516,6 +595,11 @@ async fn handle_deposit(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    // Circuit breaker: reject immediately if DB is known-broken (disk full, corrupt, etc.)
+    if state.is_db_circuit_open() {
+        return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "30")]).into_response();
+    }
+
     // Only trust X-Forwarded-For when running behind a known reverse proxy.
     // Parse the rightmost entry as IpAddr to reject spoofed non-IP values.
     let source_ip = if state.behind_proxy {
@@ -567,9 +651,11 @@ async fn handle_deposit(
     match deposit_result {
         Err(_elapsed) => {
             tracing::error!("Deposit handler timed out");
+            state.record_db_failure();
             StatusCode::NOT_FOUND.into_response()
         }
         Ok(Ok(Ok(label))) => {
+            state.record_db_success();
             info!("Deposit received: '{label}'");
             let resp = DepositResponse { status: "deposited", label };
             match serde_json::to_string(&resp) {
@@ -583,11 +669,13 @@ async fn handle_deposit(
                 tracing::debug!("Deposit replay rejected");
             } else {
                 tracing::error!("Deposit failed: {e}");
+                state.record_db_failure();
             }
             StatusCode::NOT_FOUND.into_response()
         }
         Ok(Err(e)) => {
             tracing::error!("Deposit task panicked: {e}");
+            state.record_db_failure();
             StatusCode::NOT_FOUND.into_response()
         }
     }
@@ -612,6 +700,11 @@ async fn handle_magic_link(
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    // Circuit breaker: reject immediately if DB is known-broken
+    if state.is_db_circuit_open() {
+        return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "30")]).into_response();
+    }
+
     let state_clone = state.clone();
     let code_clone = code;
     let result = tokio::time::timeout(
@@ -625,22 +718,29 @@ async fn handle_magic_link(
     match result {
         Err(_elapsed) => {
             tracing::error!("Magic link handler timed out");
+            state.record_db_failure();
             StatusCode::NOT_FOUND.into_response()
         }
         Ok(Ok(Ok(Some(_)))) => {
+            state.record_db_success();
             let resp = MagicLinkResponse { status: "verified" };
             match serde_json::to_string(&resp) {
                 Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
                 Err(_) => StatusCode::NOT_FOUND.into_response(),
             }
         }
-        Ok(Ok(Ok(None))) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(Ok(None))) => {
+            state.record_db_success();
+            StatusCode::NOT_FOUND.into_response()
+        }
         Ok(Ok(Err(e))) => {
             tracing::error!("Magic link DB error: {e}");
+            state.record_db_failure();
             StatusCode::NOT_FOUND.into_response()
         }
         Ok(Err(e)) => {
             tracing::error!("Magic link task panicked: {e}");
+            state.record_db_failure();
             StatusCode::NOT_FOUND.into_response()
         }
     }
@@ -729,6 +829,10 @@ async fn security_headers(
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("default-src 'none'"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("DENY"),
     );
     if state.tls_active {
         headers.insert(
