@@ -208,6 +208,10 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 
 ## Changelog
 
+**a609534** — Exponential backoff for supervised tasks, deposit_log retention
+- `spawn_supervised` uses exponential backoff (5s → 10s → ... → 320s cap) instead of fixed 5s delay to prevent spin loops on persistent failures (e.g. disk full)
+- Cleanup task purges `deposit_log` entries older than 90 days to prevent unbounded disk growth on long-lived servers
+
 **fdee3d2** — Harden server: 404-everything, SIGTERM/SIGHUP handling, shutdown WAL checkpoint, ciphertext size limit, SQLite mmap
 - All HTTP error paths return 404 (no 500s) to prevent information leakage
 - `shutdown_signal()` handles SIGTERM (from `atomic stop`) and SIGINT
