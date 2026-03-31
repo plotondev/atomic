@@ -348,6 +348,11 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Ed25519 signature base64 decode uses stack-allocated `[u8; 64]` instead of heap `Vec` (zero-alloc hot path)
 - Panic hook cleans orphaned `.tmp.*` files from `write_secure` atomic write pattern
 
+**56ee9d7** — zero-slack vault zeroization, credentials shrink_to_fit, SQLite connection recycling
+- Vault `decrypt()` returns `Zeroizing<Box<[u8]>>` instead of `Zeroizing<Vec<u8>>` — `into_boxed_slice()` guarantees capacity==len, so Zeroizing wipes the entire allocation with no unzeroed slack bytes
+- Credentials `save()` calls `shrink_to_fit()` on serialized JSON buffer before write, eliminating capacity slack so Zeroizing covers all bytes containing key material
+- SQLite connection pool: 1-hour max lifetime (`MAX_CONN_LIFETIME`) prevents gradual RSS growth from accumulated prepared-statement caches, schema caches, and WAL index pages; expired connections transparently replaced on next `get()`
+
 **21f5e2e** — verify_strict, single-alloc encrypt, stack-allocated key/sig decode
 - Ed25519 `verify` → `verify_strict` in deposit verification to prevent signature malleability
 - Vault encrypt uses `encrypt_in_place_detached` — single allocation, exact-sized buffer (eliminates intermediate Vec)
