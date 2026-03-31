@@ -236,6 +236,12 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - X-Forwarded-For IP validation to reject spoofed non-IP values
 - `decrypt()` returns `Zeroizing<Vec<u8>>` — plaintext wiped from memory on drop
 
+**a3f4688** — Rate limiter GC, supervisor circuit breaker, WAL checkpoint strategy, PID race fix
+- Rate limiter evicts stale entries on every access (bounded memory under DDoS/IPv6 scanning)
+- Supervisor circuit breaker: process aborts after 5 restarts in 5 minutes (prevents resource exhaustion on unrecoverable errors)
+- WAL checkpointing split: PASSIVE every 5m (non-blocking), TRUNCATE hourly (reclaims disk)
+- `atomic stop`: kill -0 probe before SIGTERM to minimize PID reuse race window
+
 ## Roadmap
 
 - [x] Identity (agent.json + Ed25519)
