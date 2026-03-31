@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use zeroize::Zeroizing;
 
 use crate::crypto::vault as crypto_vault;
 use crate::db;
@@ -18,7 +19,7 @@ pub fn vault_set(label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
     vault_set_with_conn(&conn, label, value, vault_key)
 }
 
-pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<String>> {
+pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<Zeroizing<String>>> {
     let conn = db::open()?;
     let mut stmt = conn
         .prepare("SELECT value FROM vault_secrets WHERE label = ?1")
@@ -31,10 +32,13 @@ pub fn vault_get(label: &str, vault_key: &[u8; 32]) -> Result<Option<String>> {
     match result {
         Some(encrypted) => {
             let plaintext = crypto_vault::decrypt(vault_key, &encrypted)?;
-            // plaintext is Zeroizing<Vec<u8>> — borrow, convert, then let it drop (zeroing memory)
-            let value = std::str::from_utf8(&plaintext)
-                .context("Vault value is not valid UTF-8")?
-                .to_string();
+            // Convert to String and wrap in Zeroizing so the heap copy is wiped on drop,
+            // not left as cleartext in freed memory.
+            let value = Zeroizing::new(
+                std::str::from_utf8(&plaintext)
+                    .context("Vault value is not valid UTF-8")?
+                    .to_string(),
+            );
             Ok(Some(value))
         }
         None => Ok(None),
@@ -93,7 +97,7 @@ pub fn cmd_set(label: &str, value: &str, vault_key: &[u8; 32]) -> Result<()> {
 pub fn cmd_get(label: &str, vault_key: &[u8; 32]) -> Result<()> {
     match vault_get(label, vault_key)? {
         Some(value) => {
-            print!("{value}"); // no trailing newline, so it works in $()
+            print!("{}", &*value); // no trailing newline, so it works in $()
             Ok(())
         }
         None => bail!("Label '{label}' not found in vault"),

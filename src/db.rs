@@ -164,7 +164,14 @@ fn migrate(conn: &Connection) -> Result<()> {
             source_ip  TEXT,
             user_agent TEXT,
             deposited_at INTEGER NOT NULL
-        );",
+        );
+
+        -- Indexes on time columns used by the hourly cleanup task.
+        -- Without these, DELETE ... WHERE expires_at/used_at/deposited_at < ?
+        -- does a full table scan, holding a write lock longer than necessary.
+        CREATE INDEX IF NOT EXISTS idx_magic_links_expires ON magic_links(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_used_deposits_used_at ON used_deposits(used_at);
+        CREATE INDEX IF NOT EXISTS idx_deposit_log_deposited_at ON deposit_log(deposited_at);",
     )
     .context("Failed to run migrations")?;
     Ok(())

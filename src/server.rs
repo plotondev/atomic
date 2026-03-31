@@ -295,17 +295,43 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                         }
                     };
                     let now = chrono::Utc::now().timestamp();
-                    if let Err(e) = conn.execute("DELETE FROM magic_links WHERE expires_at <= ?1", [now]) {
-                        tracing::warn!("Failed to clean expired magic links: {e}");
+                    // Paginated deletes: batch 1000 rows at a time to avoid holding
+                    // the WAL write lock for extended periods under heavy load.
+                    loop {
+                        match conn.execute(
+                            "DELETE FROM magic_links WHERE rowid IN \
+                             (SELECT rowid FROM magic_links WHERE expires_at <= ?1 LIMIT 1000)",
+                            [now],
+                        ) {
+                            Ok(0) => break,
+                            Ok(_) => continue,
+                            Err(e) => { tracing::warn!("Failed to clean expired magic links: {e}"); break; }
+                        }
                     }
                     let cutoff = now - 7 * 86400;
-                    if let Err(e) = conn.execute("DELETE FROM used_deposits WHERE used_at < ?1", [cutoff]) {
-                        tracing::warn!("Failed to clean old deposit nonces: {e}");
+                    loop {
+                        match conn.execute(
+                            "DELETE FROM used_deposits WHERE rowid IN \
+                             (SELECT rowid FROM used_deposits WHERE used_at < ?1 LIMIT 1000)",
+                            [cutoff],
+                        ) {
+                            Ok(0) => break,
+                            Ok(_) => continue,
+                            Err(e) => { tracing::warn!("Failed to clean old deposit nonces: {e}"); break; }
+                        }
                     }
                     // Purge deposit log entries older than 90 days to prevent unbounded disk growth
                     let log_cutoff = now - 90 * 86400;
-                    if let Err(e) = conn.execute("DELETE FROM deposit_log WHERE deposited_at < ?1", [log_cutoff]) {
-                        tracing::warn!("Failed to clean old deposit log entries: {e}");
+                    loop {
+                        match conn.execute(
+                            "DELETE FROM deposit_log WHERE rowid IN \
+                             (SELECT rowid FROM deposit_log WHERE deposited_at < ?1 LIMIT 1000)",
+                            [log_cutoff],
+                        ) {
+                            Ok(0) => break,
+                            Ok(_) => continue,
+                            Err(e) => { tracing::warn!("Failed to clean old deposit log entries: {e}"); break; }
+                        }
                     }
                     // TRUNCATE checkpoint hourly to reclaim WAL disk space
                     if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
