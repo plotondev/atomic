@@ -1,12 +1,55 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use std::path::Path;
+use std::sync::mpsc;
 
 use crate::config;
 
-pub fn open() -> Result<Connection> {
-    let db_path = config::atomic_dir()?.join("atomic.db");
+/// Zero-dependency connection pool for SQLite.
+/// Uses a bounded channel to distribute pre-opened connections.
+/// WAL mode allows concurrent readers; the pool prevents serialization
+/// behind a single Mutex<Connection>.
+pub struct DbPool {
+    sender: mpsc::Sender<Connection>,
+    receiver: std::sync::Mutex<mpsc::Receiver<Connection>>,
+}
 
-    // Pre-create DB file with restricted permissions (0600) before SQLite opens it
+/// RAII guard that returns the connection to the pool on drop.
+pub struct PooledConn<'a> {
+    pool: &'a DbPool,
+    conn: Option<Connection>,
+}
+
+impl<'a> std::ops::Deref for PooledConn<'a> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("PooledConn used after take")
+    }
+}
+
+impl Drop for PooledConn<'_> {
+    fn drop(&mut self) {
+        if let Some(c) = self.conn.take() {
+            let _ = self.pool.sender.send(c);
+        }
+    }
+}
+
+impl DbPool {
+    /// Get a connection from the pool, blocking up to 5 seconds.
+    pub fn get(&self) -> Result<PooledConn<'_>> {
+        let rx = self.receiver.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| anyhow::anyhow!("DB pool exhausted (5s timeout)"))?;
+        Ok(PooledConn {
+            pool: self,
+            conn: Some(conn),
+        })
+    }
+}
+
+fn ensure_db_file(db_path: &Path) -> Result<()> {
     #[cfg(unix)]
     if !db_path.exists() {
         use std::os::unix::fs::OpenOptionsExt;
@@ -14,26 +57,59 @@ pub fn open() -> Result<Connection> {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&db_path)
+            .open(db_path)
             .with_context(|| format!("Failed to create database at {}", db_path.display()))?;
     }
+    Ok(())
+}
 
-    let conn = Connection::open(&db_path)
+fn open_connection(db_path: &Path) -> Result<Connection> {
+    let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
 
     // WAL mode: fast reads, lets multiple processes access the file
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?; // NORMAL is safe with WAL mode
-    conn.pragma_update(None, "cache_size", "-64000")?; // 64MB page cache
-    conn.pragma_update(None, "busy_timeout", "5000")?; // Wait 5s for locks under contention
-    conn.pragma_update(None, "temp_store", "MEMORY")?; // Temp tables/indexes in memory
-    conn.pragma_update(None, "journal_size_limit", "67108864")?; // Cap WAL at 64MB
-    conn.pragma_update(None, "wal_autocheckpoint", "1000")?; // Checkpoint every 1000 pages
-    conn.pragma_update(None, "mmap_size", "67108864")?; // 64MB memory-mapped I/O for reads
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "cache_size", "-64000")?;
+    // 4s busy_timeout: lower than the 5s tokio::time::timeout on handlers,
+    // so SQLite returns BUSY cleanly before the task gets cancelled.
+    conn.pragma_update(None, "busy_timeout", "4000")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "journal_size_limit", "67108864")?;
+    conn.pragma_update(None, "wal_autocheckpoint", "1000")?;
+    conn.pragma_update(None, "mmap_size", "67108864")?;
 
-    // CREATE TABLE IF NOT EXISTS is idempotent — safe to run every time
+    Ok(conn)
+}
+
+/// Open a connection pool with `size` connections, each configured for WAL mode.
+/// Migrations run once on the first connection.
+pub fn open_pool(size: usize) -> Result<DbPool> {
+    let db_path = config::atomic_dir()?.join("atomic.db");
+    ensure_db_file(&db_path)?;
+
+    let first = open_connection(&db_path)?;
+    migrate(&first)?;
+
+    let (tx, rx) = mpsc::channel();
+    tx.send(first).expect("channel just created");
+
+    for _ in 1..size {
+        tx.send(open_connection(&db_path)?).expect("channel just created");
+    }
+
+    Ok(DbPool {
+        sender: tx,
+        receiver: std::sync::Mutex::new(rx),
+    })
+}
+
+/// Open a single connection (for CLI commands that don't need a pool).
+pub fn open() -> Result<Connection> {
+    let db_path = config::atomic_dir()?.join("atomic.db");
+    ensure_db_file(&db_path)?;
+    let conn = open_connection(&db_path)?;
     migrate(&conn)?;
-
     Ok(conn)
 }
 

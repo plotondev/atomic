@@ -25,6 +25,10 @@ const SUPERVISOR_MAX_RESTARTS: u32 = 5;
 /// Circuit breaker window: if SUPERVISOR_MAX_RESTARTS occur within this duration, fail-fast.
 const SUPERVISOR_WINDOW_SECS: u64 = 300; // 5 minutes
 
+/// Timeout for DB operations in HTTP handlers. Must exceed SQLite busy_timeout (4s)
+/// so that SQLite returns BUSY cleanly before the task gets force-cancelled.
+const DB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Spawn a supervised background task that restarts on panic/error with exponential backoff.
 /// Circuit breaker: if 5 restarts occur within 5 minutes, abort the process to prevent
 /// resource exhaustion on unrecoverable errors (e.g., SQLite corruption).
@@ -83,8 +87,8 @@ pub struct AppState {
     pub verifying_key: ed25519_dalek::VerifyingKey,
     /// Zeroized on drop. Derived from the private key via HKDF.
     vault_key: Zeroizing<[u8; 32]>,
-    /// Only lock inside `spawn_blocking` — never hold across an `.await`.
-    pub db: std::sync::Mutex<rusqlite::Connection>,
+    /// Connection pool — use `db_pool.get()` inside `spawn_blocking`.
+    pub db_pool: crate::db::DbPool,
     pub tls_active: bool,
     pub behind_proxy: bool,
     rate_limiter: std::sync::Mutex<HashMap<IpAddr, (u32, i64)>>,
@@ -133,6 +137,42 @@ struct MagicLinkResponse {
 const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 pub async fn run_server(credentials: Credentials) -> Result<()> {
+    // --- Startup checks ---
+
+    // Fix 6: Warn if file descriptor limit is too low for a long-lived TLS server
+    #[cfg(unix)]
+    {
+        if let Ok(output) = std::process::Command::new("sh")
+            .args(["-c", "ulimit -n"])
+            .output()
+        {
+            if let Ok(s) = std::str::from_utf8(&output.stdout) {
+                if let Ok(n) = s.trim().parse::<u64>() {
+                    if n < 4096 {
+                        tracing::warn!(
+                            "RLIMIT_NOFILE is {n}, recommended minimum 4096 for production"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Fix 8: Warn if log file is getting large (risk of disk-full on vault writes)
+    if let Ok(log_path) = config::log_path() {
+        if let Ok(metadata) = std::fs::metadata(&log_path) {
+            let size_mb = metadata.len() / (1024 * 1024);
+            if size_mb > 100 {
+                tracing::warn!(
+                    "Log file is {size_mb}MB ({}), consider rotating",
+                    log_path.display()
+                );
+            }
+        }
+    }
+
+    // --- State setup ---
+
     let agent_json_path = config::agent_json_path()?;
     let agent_json_cached: bytes::Bytes = std::fs::read_to_string(&agent_json_path)
         .with_context(|| format!("Failed to read agent.json at {}", agent_json_path.display()))?
@@ -144,7 +184,9 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
     let vault_key = crate::crypto::vault::derive_vault_key(&sk_bytes)?;
     sk_bytes.iter_mut().for_each(|b| *b = 0); // belt-and-suspenders
     drop(sk_bytes);
-    let db_conn = crate::db::open()?;
+
+    // Connection pool with 4 connections — WAL mode allows concurrent readers
+    let db_pool = crate::db::open_pool(4)?;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], credentials.port));
     let tls_mode = TlsMode::from_credentials(&credentials);
@@ -157,7 +199,7 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         agent_json_cached,
         verifying_key,
         vault_key,
-        db: std::sync::Mutex::new(db_conn),
+        db_pool,
         tls_active,
         behind_proxy,
         rate_limiter: std::sync::Mutex::new(HashMap::with_capacity(256)),
@@ -173,9 +215,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(300)).await;
                 let db_ref = st.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let conn = db_ref.db.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
-                        tracing::warn!("WAL checkpoint failed: {e}");
+                    match db_ref.db_pool.get() {
+                        Ok(conn) => {
+                            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                                tracing::warn!("WAL checkpoint failed: {e}");
+                            }
+                        }
+                        Err(e) => tracing::warn!("WAL checkpoint: pool exhausted: {e}"),
                     }
                 }).await;
             }
@@ -191,7 +237,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 let db_ref = st.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let conn = db_ref.db.lock().unwrap_or_else(|e| e.into_inner());
+                    let conn = match db_ref.db_pool.get() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("DB cleanup: pool exhausted: {e}");
+                            return;
+                        }
+                    };
                     let now = chrono::Utc::now().timestamp();
                     if let Err(e) = conn.execute("DELETE FROM magic_links WHERE expires_at <= ?1", [now]) {
                         tracing::warn!("Failed to clean expired magic links: {e}");
@@ -209,6 +261,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                     if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
                         tracing::warn!("Hourly WAL TRUNCATE checkpoint failed: {e}");
                     }
+                    // Drop connection back to pool before locking rate limiter
+                    drop(conn);
                     // Evict stale rate limiter entries
                     let mut map = db_ref.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
                     let now = chrono::Utc::now().timestamp();
@@ -312,10 +366,13 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
 
     // Final WAL checkpoint before exit to ensure all data is merged
     let _ = tokio::task::spawn_blocking(move || {
-        if let Ok(conn) = shutdown_state.db.lock() {
-            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                tracing::warn!("Final WAL checkpoint failed: {e}");
+        match shutdown_state.db_pool.get() {
+            Ok(conn) => {
+                if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                    tracing::warn!("Final WAL checkpoint failed: {e}");
+                }
             }
+            Err(e) => tracing::warn!("Final WAL checkpoint skipped: {e}"),
         }
     }).await;
 
@@ -390,22 +447,28 @@ async fn handle_deposit(
         .unwrap_or("")
         .to_string();
 
-    // DB operations in spawn_blocking.
+    // DB operations in spawn_blocking with timeout to prevent unbounded task accumulation.
     // Access vault_key via the Arc<AppState> reference inside the closure
     // to avoid copying the key out of its Zeroizing wrapper.
     let state_clone = state.clone();
     let body_clone = body;
-    let deposit_result = tokio::task::spawn_blocking(move || {
-        let conn = state_clone.db.lock()
-            .map_err(|e| anyhow::anyhow!("DB mutex poisoned: {e}"))?;
-        crate::deposit::claim_nonce_with_conn(&payload, &conn)?;
-        crate::vault::vault_set_with_conn(&conn, &payload.label, &body_clone, state_clone.vault_key())?;
-        crate::deposit::log_deposit(&conn, &payload.label, &source_ip, &user_agent)?;
-        Ok::<_, anyhow::Error>(payload.label)
-    }).await;
+    let deposit_result = tokio::time::timeout(
+        DB_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            let conn = state_clone.db_pool.get()?;
+            crate::deposit::claim_nonce_with_conn(&payload, &conn)?;
+            crate::vault::vault_set_with_conn(&conn, &payload.label, &body_clone, state_clone.vault_key())?;
+            crate::deposit::log_deposit(&conn, &payload.label, &source_ip, &user_agent)?;
+            Ok::<_, anyhow::Error>(payload.label)
+        })
+    ).await;
 
     match deposit_result {
-        Ok(Ok(label)) => {
+        Err(_elapsed) => {
+            tracing::error!("Deposit handler timed out");
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Ok(Ok(Ok(label))) => {
             info!("Deposit received: '{label}'");
             let resp = DepositResponse { status: "deposited", label };
             match serde_json::to_string(&resp) {
@@ -413,7 +476,7 @@ async fn handle_deposit(
                 Err(_) => StatusCode::NOT_FOUND.into_response(),
             }
         }
-        Ok(Err(e)) => {
+        Ok(Ok(Err(e))) => {
             let msg = e.to_string();
             if msg.contains("Nonce already used") {
                 tracing::debug!("Deposit replay rejected");
@@ -422,7 +485,7 @@ async fn handle_deposit(
             }
             StatusCode::NOT_FOUND.into_response()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("Deposit task panicked: {e}");
             StatusCode::NOT_FOUND.into_response()
         }
@@ -446,26 +509,32 @@ async fn handle_magic_link(
 
     let state_clone = state.clone();
     let code_clone = code;
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = state_clone.db.lock()
-            .map_err(|e| anyhow::anyhow!("DB mutex poisoned: {e}"))?;
-        Ok::<_, anyhow::Error>(crate::magic_link::claim_with_conn(&code_clone, &conn))
-    }).await;
+    let result = tokio::time::timeout(
+        DB_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            let conn = state_clone.db_pool.get()?;
+            Ok::<_, anyhow::Error>(crate::magic_link::claim_with_conn(&code_clone, &conn))
+        })
+    ).await;
 
     match result {
-        Ok(Ok(Some(_))) => {
+        Err(_elapsed) => {
+            tracing::error!("Magic link handler timed out");
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Ok(Ok(Ok(Some(_)))) => {
             let resp = MagicLinkResponse { status: "verified" };
             match serde_json::to_string(&resp) {
                 Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
                 Err(_) => StatusCode::NOT_FOUND.into_response(),
             }
         }
-        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
-        Ok(Err(e)) => {
+        Ok(Ok(Ok(None))) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(Err(e))) => {
             tracing::error!("Magic link DB error: {e}");
             StatusCode::NOT_FOUND.into_response()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("Magic link task panicked: {e}");
             StatusCode::NOT_FOUND.into_response()
         }
@@ -473,16 +542,21 @@ async fn handle_magic_link(
 }
 
 async fn handle_health(State(state): State<Arc<AppState>>) -> Response {
-    // Check DB is responsive
-    let db_ok = {
-        let st = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = st.db.lock().unwrap_or_else(|e| e.into_inner());
-            conn.execute_batch("SELECT 1").is_ok()
+    // Check DB is responsive (with timeout)
+    let db_ok = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking({
+            let st = state.clone();
+            move || match st.db_pool.get() {
+                Ok(conn) => conn.execute_batch("SELECT 1").is_ok(),
+                Err(_) => false,
+            }
         })
-        .await
-        .unwrap_or(false)
-    };
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .unwrap_or(false);
 
     // Check agent.json is valid JSON
     let agent_ok = serde_json::from_slice::<serde_json::Value>(&state.agent_json_cached).is_ok();

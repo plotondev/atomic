@@ -73,8 +73,11 @@ impl Credentials {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self).context("Failed to serialize credentials")?;
-        crate::config::write_secure(path, json.as_bytes())
+        // Write directly into a Zeroizing<Vec<u8>> so the private key material
+        // in the serialized JSON is zeroed on drop, not left in freed heap memory.
+        let mut buf = zeroize::Zeroizing::new(Vec::new());
+        serde_json::to_writer_pretty(&mut *buf, self).context("Failed to serialize credentials")?;
+        crate::config::write_secure(path, &buf)
     }
 
     pub fn load(path: &Path) -> Result<Self> {
