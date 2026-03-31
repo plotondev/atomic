@@ -348,6 +348,12 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Ed25519 signature base64 decode uses stack-allocated `[u8; 64]` instead of heap `Vec` (zero-alloc hot path)
 - Panic hook cleans orphaned `.tmp.*` files from `write_secure` atomic write pattern
 
+**21f5e2e** — verify_strict, single-alloc encrypt, stack-allocated key/sig decode
+- Ed25519 `verify` → `verify_strict` in deposit verification to prevent signature malleability
+- Vault encrypt uses `encrypt_in_place_detached` — single allocation, exact-sized buffer (eliminates intermediate Vec)
+- `decode_public_key`, `decode_private_key`, `decode_signature` decode into stack buffers instead of heap-allocated `decode_vec`
+- `is_valid_input` uses idiomatic `!s.is_empty()`
+
 **5fc281e** — AES-GCM zeroize, dynamic pool sizing, health check WAL monitor
 - Enable `zeroize` feature on `aes-gcm`: AES key schedule is now wiped from memory on cipher drop
 - DB connection pool sized dynamically via `available_parallelism()` (clamped 2..8) instead of hardcoded 4
