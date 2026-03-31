@@ -250,6 +250,11 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - Startup guard: warn if `RLIMIT_NOFILE < 4096` (prevents cryptic fd exhaustion under TLS load)
 - Startup guard: warn if log file exceeds 100MB (prevents disk-full failures on vault atomic writes)
 
+**5fc281e** — AES-GCM zeroize, dynamic pool sizing, health check WAL monitor
+- Enable `zeroize` feature on `aes-gcm`: AES key schedule is now wiped from memory on cipher drop
+- DB connection pool sized dynamically via `available_parallelism()` (clamped 2..8) instead of hardcoded 4
+- Health endpoint (`/_/health`) now reports WAL file size, returns degraded if WAL exceeds 50MB
+
 ## Roadmap
 
 - [x] Identity (agent.json + Ed25519)
