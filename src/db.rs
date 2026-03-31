@@ -27,6 +27,8 @@ pub fn open() -> Result<Connection> {
     conn.pragma_update(None, "cache_size", "-2000")?;
     conn.pragma_update(None, "busy_timeout", "5000")?; // Wait 5s for locks under contention
     conn.pragma_update(None, "journal_size_limit", "67108864")?; // Cap WAL at 64MB
+    conn.pragma_update(None, "wal_autocheckpoint", "1000")?; // Checkpoint every 1000 pages
+    conn.pragma_update(None, "mmap_size", "67108864")?; // 64MB memory-mapped I/O for reads
 
     // CREATE TABLE IF NOT EXISTS is idempotent — safe to run every time
     migrate(&conn)?;

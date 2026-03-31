@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 
 const NONCE_SIZE: usize = 12;
 const HKDF_SALT: &[u8] = b"atomic-v1";
+const MAX_CIPHERTEXT_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
 // HKDF with salt and "atomic-vault" context, so the vault key differs from the signing key.
 pub fn derive_vault_key(private_key_bytes: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
@@ -44,6 +45,9 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if data.len() < NONCE_SIZE {
         anyhow::bail!("Encrypted data too short");
+    }
+    if data.len() > MAX_CIPHERTEXT_SIZE {
+        anyhow::bail!("Encrypted data too large");
     }
 
     let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
@@ -108,6 +112,14 @@ mod tests {
     fn decrypt_too_short() {
         let key = [42u8; 32];
         assert!(decrypt(&key, &[0u8; 5]).is_err());
+    }
+
+    #[test]
+    fn decrypt_oversized_rejected() {
+        let key = [42u8; 32];
+        let oversized = vec![0u8; MAX_CIPHERTEXT_SIZE + 1];
+        let err = decrypt(&key, &oversized).unwrap_err();
+        assert!(err.to_string().contains("too large"));
     }
 
     #[test]

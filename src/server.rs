@@ -155,6 +155,8 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let shutdown_state = state.clone();
+
     let public_routes = Router::new()
         .route("/.well-known/agent.json", get(serve_agent_json))
         .layer(cors);
@@ -195,11 +197,37 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
             if is_auto {
                 crate::tls::spawn_renewal_watcher(rustls_config.clone());
             }
+            // Reload TLS cert on SIGHUP (works for both auto and custom certs)
+            #[cfg(unix)]
+            {
+                let sighup_config = rustls_config.clone();
+                tokio::spawn(async move {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sighup = signal(SignalKind::hangup())
+                        .expect("Failed to install SIGHUP handler");
+                    loop {
+                        sighup.recv().await;
+                        let tls_dir = match crate::config::tls_dir() {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!("SIGHUP cert reload failed: {e}");
+                                continue;
+                            }
+                        };
+                        let cert_path = tls_dir.join("fullchain.pem");
+                        let key_path = tls_dir.join("key.pem");
+                        match sighup_config.reload_from_pem_file(&cert_path, &key_path).await {
+                            Ok(()) => info!("TLS cert reloaded (SIGHUP)"),
+                            Err(e) => tracing::warn!("TLS cert reload failed (SIGHUP): {e}"),
+                        }
+                    }
+                });
+            }
             let handle = axum_server::Handle::new();
             let shutdown_handle = handle.clone();
             tokio::spawn(async move {
                 shutdown_signal().await;
-                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+                shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
             });
             let mode_label = if is_auto { "acme.sh" } else { "custom cert" };
             info!("Listening on {} (HTTPS/{}, PID {})", addr, mode_label, std::process::id());
@@ -210,6 +238,15 @@ pub async fn run_server(credentials: Credentials) -> Result<()> {
                 .context("TLS server error")?;
         }
     }
+
+    // Final WAL checkpoint before exit to ensure all data is merged
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = shutdown_state.db.lock() {
+            if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                tracing::warn!("Final WAL checkpoint failed: {e}");
+            }
+        }
+    }).await;
 
     let _ = std::fs::remove_file(&pid_path);
     info!("Server stopped");
@@ -291,20 +328,21 @@ async fn handle_deposit(
             let resp = DepositResponse { status: "deposited", label };
             match serde_json::to_string(&resp) {
                 Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
             }
         }
         Ok(Err(e)) => {
-            let err_msg = format!("{e}");
-            if err_msg.contains("replay") || err_msg.contains("Nonce already used") {
-                return StatusCode::NOT_FOUND.into_response();
+            let msg = e.to_string();
+            if msg.contains("Nonce already used") {
+                tracing::debug!("Deposit replay rejected");
+            } else {
+                tracing::error!("Deposit failed: {e}");
             }
-            tracing::error!("Deposit failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            StatusCode::NOT_FOUND.into_response()
         }
         Err(e) => {
-            tracing::error!("Deposit task panicked: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            tracing::error!("Deposit task panicked: {e}");
+            StatusCode::NOT_FOUND.into_response()
         }
     }
 }
@@ -337,17 +375,17 @@ async fn handle_magic_link(
             let resp = MagicLinkResponse { status: "verified" };
             match serde_json::to_string(&resp) {
                 Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json).into_response(),
-                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
             }
         }
         Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {
             tracing::error!("Magic link DB error: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            StatusCode::NOT_FOUND.into_response()
         }
         Err(e) => {
             tracing::error!("Magic link task panicked: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            StatusCode::NOT_FOUND.into_response()
         }
     }
 }
@@ -389,8 +427,25 @@ async fn security_headers(
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C handler");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => {
+                if let Err(e) = r {
+                    tracing::error!("CTRL+C handler error: {e}");
+                }
+            }
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install CTRL+C handler");
+    }
     info!("Shutdown signal received");
 }
