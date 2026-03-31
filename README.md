@@ -217,6 +217,14 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 - `decrypt()` rejects ciphertext >16MB before allocation (resource exhaustion defense)
 - SQLite: `wal_autocheckpoint=1000` pages, `mmap_size=64MB` for read throughput
 
+**a7d7afb** — Resilience hardening: supervised tasks, health endpoint, input validation, SQLite tuning
+- Background tasks (WAL checkpoint, DB cleanup) auto-restart on panic with 5s backoff
+- `/_/health` endpoint: checks DB + agent.json, returns 200/503 for load balancer integration
+- Input validation rejects non-printable chars and labels > 256 bytes on deposit and magic link paths
+- SQLite page cache bumped to 64MB, temp tables stored in memory
+- X-Forwarded-For warning when header present but `behind_proxy=false` (misconfiguration detection)
+- Mutex poisoning recovery uses `into_inner()` consistently across all lock sites
+
 **fcfffe5** — Production hardening: SQLite resilience, fsync durability, WAL checkpointing, zeroize decrypt output
 - SQLite: `busy_timeout=5s`, `journal_size_limit=64MB`, `synchronous=NORMAL` (WAL-safe)
 - Atomic writes: fsync data + parent directory on Unix for crash safety
