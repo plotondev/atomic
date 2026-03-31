@@ -191,6 +191,16 @@ Cross-compiles to `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-apple-darwi
 
 ## Changelog
 
+**182f8ad** — Zero-alloc deposit verify, WITHOUT ROWID, auto_vacuum, remove stub commands
+- `deposit.rs`: eliminate `try_verify_signature` indirection — `verify_signature` now returns `Option` directly with zero heap allocation on failure. Removes all `anyhow` from the deposit verification hot path (no `Box<dyn Error>` per invalid request), hardening against DoS via invalid-token heap pressure. Stack buffer increased from 768→1024 bytes.
+- `db.rs`: add `PRAGMA auto_vacuum = INCREMENTAL` — reclaims space from TTL-deleted deposit nonces without full-vacuum stalls. Set before table creation so new databases get incremental auto-vacuum from the start.
+- `db.rs`: add `WITHOUT ROWID` to `used_deposits` table — eliminates the separate rowid B-tree, saving one B-tree per row since the nonce PK *is* the clustering key. Only applies to new databases (`CREATE TABLE IF NOT EXISTS` is a no-op on existing).
+- `db.rs`: remove legacy `DROP TABLE IF EXISTS magic_links` migration — table was dropped iterations ago; running the DDL every startup is unnecessary I/O.
+- `server.rs`: cleanup task now deletes expired deposits by PK (`nonce IN (SELECT nonce ...)`) instead of `rowid`, compatible with both `WITHOUT ROWID` and regular tables.
+- `cli.rs`: remove `KeyCommand` and `ServiceCommand` enums and their `Key`/`Service` command variants — dead stub code that only printed "not yet implemented". Reduces binary size and attack surface; will be re-added when PLO-58/PLO-59 are implemented.
+- `main.rs`: remove corresponding match arms and unused imports.
+- Net: −75 lines / +21 lines (−54 net), 61 tests passing.
+
 **3d768ca** — Kill magic_link module, CryptoError replaces anyhow in crypto paths, VecDeque pool, drop background tasks
 - `magic_link.rs`: deleted entirely (~175 lines). Magic link domain verification removed — DNS TXT records are sufficient for domain-as-identity. Drops `subtle` dependency, removes DB table, server route, CLI command, hourly cleanup logic.
 - `crypto/mod.rs`: new `CryptoError` enum (zero-allocation, opaque error messages) replaces `anyhow::Result` in all crypto functions. Prevents information leakage via error strings; eliminates heap allocation in crypto paths.
